@@ -1,5 +1,5 @@
 # app.py
-import os, io, time, re, tempfile, subprocess, uuid, logging
+import os, io, time, re, tempfile, subprocess, uuid, logging, shutil
 from typing import Optional, Dict, Any
 
 import numpy as np
@@ -100,68 +100,97 @@ def _try_meshfix(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         log.warning("meshfix failed: %s", e)
         return mesh
 
-def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
-    """
-    Volumen robust bestimmen.
-    1) Wenn watertight: mesh.volume
-    2) Versuch: meshfix → dann volume
-    3) Fallback: konvexe Hülle
-    """
-    try:
-        if isinstance(mesh, trimesh.Trimesh) and mesh.is_volume:
-            return float(abs(mesh.volume))
-
-        # Reparaturversuch
-        m2 = _try_meshfix(mesh)
-        if isinstance(m2, trimesh.Trimesh) and m2.is_volume:
-            return float(abs(m2.volume))
-
-        # Fallback: konvexe Hülle
-        hull = mesh.convex_hull
-        if isinstance(hull, trimesh.Trimesh) and hull.is_volume:
-            return float(abs(hull.volume))
-    except Exception as e:
-        log.warning("volume computation fallback failed: %s", e)
-
-    # Letzter Fallback: 0
-    return 0.0
-
 def _load_mesh_from_bytes(stl_bytes: bytes, unit: str = "mm") -> trimesh.Trimesh:
     """
     STL robust laden (binary oder ASCII), ohne aggressive Auto-Reparaturen.
     Skalierung: Wenn unit == 'cm', erst in cm laden, anschließend 10x nach mm.
     """
-    # Viele STLs werden als application/octet-stream hochgeladen
     file_obj = io.BytesIO(stl_bytes)
     mesh = trimesh.load(file_obj, file_type='stl', process=False, maintain_order=True)
+
+    if isinstance(mesh, trimesh.Scene):
+        geos = [g for g in mesh.dump().values() if isinstance(g, trimesh.Trimesh)]
+        if not geos:
+            raise ValueError("STL enthält keine Flächen.")
+        mesh = trimesh.util.concatenate(geos)
+
     if not isinstance(mesh, trimesh.Trimesh):
-        # Falls mehrere Geometrien: zu einem Mesh zusammenfassen (Scene→Trimesh)
-        if isinstance(mesh, trimesh.Scene):
-            mesh = trimesh.util.concatenate(tuple(
-                g for g in mesh.dump().values() if isinstance(g, trimesh.Trimesh)
-            ))
-        else:
-            raise ValueError("STL konnte nicht als Trimesh geladen werden.")
+        raise ValueError("STL konnte nicht als Mesh geladen werden.")
 
     # Units -> immer in mm normalisieren
     unit = (unit or "mm").strip().lower()
     if unit == "cm":
         mesh.apply_scale(10.0)
-    elif unit == "mm":
-        pass
-    else:
-        # unbekannte Einheit -> mm annehmen
-        pass
 
-    # Geometrie aufräumen (duplikate vert/degenerate faces entfernen wo möglich)
+    # sanftes Aufräumen
     try:
         mesh.remove_duplicate_faces()
         mesh.remove_degenerate_faces()
         mesh.remove_unreferenced_vertices()
+        mesh.merge_vertices()
+    except Exception:
+        pass
+
+    # Komponenten splitten, Mini-Inseln verwerfen: größte Komponente wählen
+    try:
+        comps = mesh.split(only_watertight=False)
+        if len(comps) > 1:
+            def comp_key(m: trimesh.Trimesh) -> float:
+                try:
+                    return abs(float(m.volume)) if m.is_volume else float(m.bounding_box_oriented.volume)
+                except Exception:
+                    return float(m.bounding_box_oriented.volume)
+            mesh = max(comps, key=comp_key)
     except Exception:
         pass
 
     return mesh
+
+def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
+    """
+    Volumen robust bestimmen.
+    1) Wenn watertight: mesh.volume
+    2) Löcher füllen / Normale fixen
+    3) pymeshfix
+    4) Konvexe Hülle
+    """
+    try:
+        if mesh.is_volume:
+            v = float(abs(mesh.volume))
+            if np.isfinite(v) and v > 0:
+                return v
+    except Exception:
+        pass
+
+    try:
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_normals(mesh, multibody=True)
+        if mesh.is_volume:
+            v = float(abs(mesh.volume))
+            if np.isfinite(v) and v > 0:
+                return v
+    except Exception:
+        pass
+
+    try:
+        m2 = _try_meshfix(mesh)
+        if isinstance(m2, trimesh.Trimesh) and m2.is_volume:
+            v = float(abs(m2.volume))
+            if np.isfinite(v) and v > 0:
+                return v
+    except Exception:
+        pass
+
+    try:
+        hull = mesh.convex_hull
+        if isinstance(hull, trimesh.Trimesh) and hull.is_volume:
+            v = float(abs(hull.volume))
+            if np.isfinite(v) and v > 0:
+                return v
+    except Exception:
+        pass
+
+    return 0.0
 
 def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit: str = "mm") -> float:
     """
@@ -169,7 +198,6 @@ def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit: str = "mm") -> float:
     """
     mesh = _load_mesh_from_bytes(stl_bytes, unit=unit)
     vol_mm3 = _safe_volume_from_mesh(mesh)
-    # Sanity: neg/NaN abfangen
     if not np.isfinite(vol_mm3) or vol_mm3 < 0:
         vol_mm3 = 0.0
     return float(vol_mm3)
@@ -233,7 +261,7 @@ def health():
 async def analyze_model(
     file: UploadFile = File(..., description="STL-Datei"),
     unit: Optional[str] = Form(None),
-    unit_is_mm: Optional[bool] = Form(None)  # Backwards-Compat (true/false)
+    unit_is_mm: Optional[bool] = Form(None)  # Backwards-Compat
 ):
     """
     Ermittelt präzises Volumen des hochgeladenen STL.
@@ -247,11 +275,9 @@ async def analyze_model(
     ):
         raise HTTPException(400, "Bitte STL-Datei hochladen.")
 
-    # Größenlimit prüfen (wenn Upload-Backend die Größe liefert)
     if getattr(file, "size", None) and file.size > MAX_FILE_BYTES:
         raise HTTPException(413, "Datei zu groß (max 50 MB).")
 
-    # Einheit auflösen
     resolved_unit = "mm"
     if unit:
         if unit.strip().lower() in ("mm","cm"):
@@ -330,7 +356,11 @@ async def slice_check(
     layer_height: float = Form(0.2),
     nozzle: float = Form(0.4),
 ):
-    # --- 0) Basisschutz & Normalisierung ---
+    # --- 0) PrusaSlicer-Binary prüfen (klare Fehlermeldung) ---
+    if not os.path.exists(PRUSASLICER_BIN) and shutil.which(PRUSASLICER_BIN) is None:
+        raise HTTPException(500, f"PrusaSlicer nicht gefunden unter: {PRUSASLICER_BIN}")
+
+    # --- 1) Basisschutz & Normalisierung ---
     if file.content_type not in (
         "application/sla","application/octet-stream","model/stl",
         "application/vnd.ms-pki.stl","application/x-stl"
@@ -357,7 +387,7 @@ async def slice_check(
     except: nozzle = 0.4
     nozzle = max(0.2, min(1.0, nozzle))
 
-    # --- 1) Datei speichern ---
+    # --- 2) Datei speichern ---
     with tempfile.TemporaryDirectory() as td:
         stl_path = os.path.join(td, "model.stl")
         gcode_path = os.path.join(td, "out.gcode")
@@ -370,10 +400,10 @@ async def slice_check(
         with open(stl_path, "wb") as f:
             f.write(raw)
 
-        # --- 2) (optional) Health-Issues (hier leer, kann mit analyze-Checks ergänzt werden)
+        # --- 3) Optional: Health-Issues (hier leer, kann mit analyze-Checks ergänzt werden)
         issues = []
 
-        # --- 3) Minimal-INI generieren ---
+        # --- 4) Minimal-INI generieren ---
         dens = DENSITIES.get(mat, 1.25)
         ini = f"""
 print_settings_id =
@@ -389,10 +419,10 @@ filament_density = {dens}
         with open(cfg_path, "w") as f:
             f.write(ini)
 
-        # --- 4) cm → mm skalieren (vor dem Slicen) ---
+        # --- 5) cm → mm skalieren (vor dem Slicen) ---
         scale_arg = ["--scale", "10"] if unit == "cm" else []
 
-        # --- 5) PrusaSlicer aufrufen ---
+        # --- 6) PrusaSlicer aufrufen ---
         cmd = [
             PRUSASLICER_BIN,
             "--no-gui",
@@ -415,7 +445,7 @@ filament_density = {dens}
             log.error("PrusaSlicer stderr: %s", res.stderr[:4000])
             raise HTTPException(500, "Slicing fehlgeschlagen.")
 
-        # --- 6) G-Code Header parsen ---
+        # --- 7) G-Code Header parsen (nur erste ~200 Zeilen) ---
         head = ""
         with open(gcode_path, "r", encoding="utf-8", errors="ignore") as g:
             for i, line in zip(range(200), g):
