@@ -13,6 +13,7 @@ RUN curl -L -o /tmp/ps.AppImage \
     && mv squashfs-root /opt/prusaslicer \
     && rm -f /tmp/ps.AppImage
 
+# >>> WICHTIG: Pfad auf die entpackte Binary setzen (NICHT /usr/bin)
 ENV PRUSASLICER_BIN=/opt/prusaslicer/usr/bin/prusa-slicer
 ENV PRUSASLICER_TIMEOUT=180
 ENV PYTHONUNBUFFERED=1
@@ -20,7 +21,6 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
 COPY app.py .
 
 ENTRYPOINT ["/usr/bin/tini","--"]
