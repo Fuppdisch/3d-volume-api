@@ -3,5 +3,8 @@ uvicorn[standard]
 trimesh
 numpy
 pydantic
+python-multipart
+
+
 
 
