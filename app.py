@@ -16,17 +16,17 @@ from pydantic import BaseModel
 log = logging.getLogger("uvicorn.error")
 
 # ===== FastAPI + CORS =====
-app = FastAPI(title="3D Volume API", version="0.2.0")
+app = FastAPI(title="3D Volume API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
-    # TODO: in Produktion auf deine Domains einschränken:
+    # TODO: In Produktion auf deine Domain(s) einschränken:
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== In-Memory Store (für /weight mit model_id) =====
+# ===== In-Memory Store (für /weight mit model_id; Frontend sollte /weight_direct nutzen) =====
 MODELS: Dict[str, Dict] = {}
 
 # ===== Dichten (g/cm³) =====
@@ -73,7 +73,7 @@ def _repair_mesh(m: trimesh.Trimesh) -> trimesh.Trimesh:
     except Exception as e:
         log.warning(f"fix_normals failed: {e}")
 
-    # füllt kleine Löcher (ändert m in-place)
+    # kleine Löcher füllen (ändert m in-place)
     try:
         repair.fill_holes(m)
     except Exception as e:
@@ -89,7 +89,7 @@ def _repair_mesh(m: trimesh.Trimesh) -> trimesh.Trimesh:
             log.warning(f"repair {fn_name} failed: {e}")
 
     try:
-        m.process(validate=True)  # optional (SciPy kann fehlen)
+        m.process(validate=True)  # optional; SciPy kann fehlen → Warnung ok
     except Exception as e:
         log.warning(f"process(validate) failed: {e}")
 
@@ -112,8 +112,9 @@ def _voxel_fallback_mm3(m: trimesh.Trimesh) -> float:
         log.error(f"voxel fallback failed: {e}")
         raise HTTPException(status_code=422, detail=f"Voxel-Fallback fehlgeschlagen: {e}")
 
-# ===== Volumenberechnung (mm³) aus Bytes =====
-def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit_is_mm: bool = True) -> float:
+# ===== Volumenberechnung (mm³) aus Bytes – mit Einheitsskalierung =====
+def _volume_mm3_with_unit(stl_bytes: bytes, unit: str = "mm") -> float:
+    # Laden
     try:
         mesh = trimesh.load(io.BytesIO(stl_bytes), file_type="stl", force="mesh")
     except Exception as e:
@@ -123,25 +124,29 @@ def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit_is_mm: bool = True) -> 
     if mesh.is_empty:
         raise HTTPException(status_code=400, detail="STL enthält kein gültiges Mesh.")
 
-    # Einheiten-Handling: wir erwarten mm
-    if not unit_is_mm:
-        try:
-            mesh.apply_scale(1000.0)  # z. B. m → mm
-        except Exception as e:
-            log.warning(f"apply_scale failed: {e}")
-
+    # Reparatur
     mesh = _repair_mesh(mesh)
 
+    # Rohvolumen in Mesh-Einheiten³
     if mesh.is_watertight:
         try:
-            return float(mesh.volume)  # mm³
+            raw_vol = float(mesh.volume)
         except Exception as e:
             log.warning(f"mesh.volume failed, fallback to voxel: {e}")
+            raw_vol = _voxel_fallback_mm3(mesh)
+    else:
+        raw_vol = _voxel_fallback_mm3(mesh)
 
-    # Fallback: robust bei Leaks/offenen Meshes
-    return _voxel_fallback_mm3(mesh)
+    # Einheit → mm skalieren
+    unit = (unit or "mm").lower()
+    scale_map = {"mm": 1.0, "cm": 10.0, "m": 1000.0}
+    if unit not in scale_map:
+        raise HTTPException(status_code=400, detail=f"Unbekannte Einheit: {unit}")
+    s = scale_map[unit]  # Faktor von unit → mm
+    vol_mm3 = raw_vol * (s ** 3)
+    return vol_mm3
 
-# ===== Pydantic Schemas =====
+# ===== Schemas =====
 class AnalyzeResponse(BaseModel):
     model_id: str
     volume_mm3: float
@@ -172,13 +177,13 @@ def health():
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_model(
     file: UploadFile = File(...),
-    unit_is_mm: bool = Form(True),
+    unit: str = Form("mm"),  # "mm" | "cm" | "m"
 ):
     stl_bytes = await file.read()
-    vol_mm3 = compute_volume_mm3_from_bytes(stl_bytes, unit_is_mm=unit_is_mm)
+    vol_mm3 = _volume_mm3_with_unit(stl_bytes, unit=unit)
 
     model_id = str(uuid.uuid4())
-    MODELS[model_id] = {"volume_mm3": vol_mm3}
+    MODELS[model_id] = {"volume_mm3": vol_mm3}  # nur für /weight (Swagger-Tests)
 
     return AnalyzeResponse(
         model_id=model_id,
@@ -198,4 +203,3 @@ async def calc_weight(payload: WeightRequest):
 async def weight_direct(payload: WeightDirectRequest):
     g = _weight_g(payload.volume_mm3, payload.material, payload.infill)
     return {"weight_g": _round3(g)}
-
