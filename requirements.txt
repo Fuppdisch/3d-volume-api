@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+trimesh
+numpy
+pydantic
+pymeshfix
