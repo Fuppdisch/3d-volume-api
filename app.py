@@ -17,21 +17,19 @@ MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(50 * 1024 * 1024)))  # 50MB
 MODEL_TTL_SECONDS = int(os.getenv("MODEL_TTL_SECONDS", "7200"))           # 2h Cache
 
 # PrusaSlicer (für /slice_check)
-PRUSASLICER_BIN = os.getenv("PRUSASLICER_BIN", "/usr/bin/prusa-slicer")
-PRUSASLICER_TIMEOUT = int(os.getenv("PRUSASLICER_TIMEOUT", "120"))
+# Default absichtlich auf AppImage-Pfad gesetzt – passt zu unserem Dockerfile.
+PRUSASLICER_BIN = os.getenv("PRUSASLICER_BIN", "/opt/prusaslicer/usr/bin/prusa-slicer")
+PRUSASLICER_TIMEOUT = int(os.getenv("PRUSASLICER_TIMEOUT", "180"))
 
 # CORS
-ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
 # Dichten (g/cm³)
-DENSITIES = {
-    "PLA": 1.25,
-    "PETG": 1.26,
-    "ASA": 1.08,
-    "PC":  1.20
-}
+DENSITIES = {"PLA": 1.25, "PETG": 1.26, "ASA": 1.08, "PC": 1.20}
 
+# ---------------------------------------------------------
 # G-Code Header Parser (verschiedene PrusaSlicer-Versionen)
+# ---------------------------------------------------------
 RE_TIME = re.compile(r";\s*estimated printing time.*?=\s*([0-9hms :]+)", re.I)
 RE_TIME_ALT = re.compile(r";\s*TIME\s*:\s*(\d+)", re.I)  # Sekunden
 RE_FIL_M = re.compile(r";\s*Filament used\s*:\s*([\d\.]+)\s*m", re.I)
@@ -64,13 +62,12 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("api")
 
 # ---------------------------------------------------------
-# Model Cache für Volumen pro Upload
+# Model Cache (Volumen pro Upload)
 # ---------------------------------------------------------
 # { model_id: { "ts": epoch, "volume_mm3": float, "meta": {...} } }
 MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def _gc_cache():
-    """Altlasten aus dem Cache werfen."""
     now = time.time()
     stale = [k for k, v in MODEL_CACHE.items() if now - v.get("ts", 0) > MODEL_TTL_SECONDS]
     for k in stale:
@@ -86,7 +83,6 @@ except Exception:
     HAS_MESHFIX = False
 
 def _try_meshfix(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Falls möglich, mit pymeshfix reparieren (watertight)."""
     if not HAS_MESHFIX:
         return mesh
     try:
@@ -100,11 +96,10 @@ def _try_meshfix(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
         log.warning("meshfix failed: %s", e)
         return mesh
 
+# ---------------------------------------------------------
+# Laden & Bereinigen
+# ---------------------------------------------------------
 def _load_mesh_from_bytes(stl_bytes: bytes, unit: str = "mm") -> trimesh.Trimesh:
-    """
-    STL robust laden (binary oder ASCII), ohne aggressive Auto-Reparaturen.
-    Skalierung: Wenn unit == 'cm', erst in cm laden, anschließend 10x nach mm.
-    """
     file_obj = io.BytesIO(stl_bytes)
     mesh = trimesh.load(file_obj, file_type='stl', process=False, maintain_order=True)
 
@@ -117,12 +112,12 @@ def _load_mesh_from_bytes(stl_bytes: bytes, unit: str = "mm") -> trimesh.Trimesh
     if not isinstance(mesh, trimesh.Trimesh):
         raise ValueError("STL konnte nicht als Mesh geladen werden.")
 
-    # Units -> immer in mm normalisieren
+    # Units → mm normalisieren
     unit = (unit or "mm").strip().lower()
     if unit == "cm":
         mesh.apply_scale(10.0)
 
-    # sanftes Aufräumen
+    # Aufräumen
     try:
         mesh.remove_duplicate_faces()
         mesh.remove_degenerate_faces()
@@ -131,7 +126,7 @@ def _load_mesh_from_bytes(stl_bytes: bytes, unit: str = "mm") -> trimesh.Trimesh
     except Exception:
         pass
 
-    # Komponenten splitten, Mini-Inseln verwerfen: größte Komponente wählen
+    # Größte Komponente wählen
     try:
         comps = mesh.split(only_watertight=False)
         if len(comps) > 1:
@@ -147,13 +142,7 @@ def _load_mesh_from_bytes(stl_bytes: bytes, unit: str = "mm") -> trimesh.Trimesh
     return mesh
 
 def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
-    """
-    Volumen robust bestimmen.
-    1) Wenn watertight: mesh.volume
-    2) Löcher füllen / Normale fixen
-    3) pymeshfix
-    4) Konvexe Hülle
-    """
+    # 1) Direktes Volumen (wenn geschlossen)
     try:
         if mesh.is_volume:
             v = float(abs(mesh.volume))
@@ -162,6 +151,7 @@ def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
     except Exception:
         pass
 
+    # 2) Löcher füllen, Normale fixen
     try:
         trimesh.repair.fill_holes(mesh)
         trimesh.repair.fix_normals(mesh, multibody=True)
@@ -172,6 +162,7 @@ def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
     except Exception:
         pass
 
+    # 3) pymeshfix
     try:
         m2 = _try_meshfix(mesh)
         if isinstance(m2, trimesh.Trimesh) and m2.is_volume:
@@ -181,6 +172,7 @@ def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
     except Exception:
         pass
 
+    # 4) Konvexe Hülle
     try:
         hull = mesh.convex_hull
         if isinstance(hull, trimesh.Trimesh) and hull.is_volume:
@@ -193,9 +185,6 @@ def _safe_volume_from_mesh(mesh: trimesh.Trimesh) -> float:
     return 0.0
 
 def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit: str = "mm") -> float:
-    """
-    Haupt-Volumenroutine. Liefert mm³.
-    """
     mesh = _load_mesh_from_bytes(stl_bytes, unit=unit)
     vol_mm3 = _safe_volume_from_mesh(mesh)
     if not np.isfinite(vol_mm3) or vol_mm3 < 0:
@@ -209,7 +198,7 @@ app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS],
+    allow_origins=ALLOWED_ORIGINS or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -255,7 +244,16 @@ def root():
 @app.get("/health")
 def health():
     _gc_cache()
-    return {"ok": True, "cache_size": len(MODEL_CACHE)}
+    # Diagnose für PrusaSlicer-Pfad
+    exists = os.path.exists(PRUSASLICER_BIN)
+    which = shutil.which(PRUSASLICER_BIN) if "/" not in PRUSASLICER_BIN else None
+    return {
+        "ok": True,
+        "cache_size": len(MODEL_CACHE),
+        "PRUSASLICER_BIN": PRUSASLICER_BIN,
+        "bin_exists": exists,
+        "shutil_which": which
+    }
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_model(
@@ -264,10 +262,9 @@ async def analyze_model(
     unit_is_mm: Optional[bool] = Form(None)  # Backwards-Compat
 ):
     """
-    Ermittelt präzises Volumen des hochgeladenen STL.
-    Einheit:
+    Präzises Volumen bestimmen. Einheit:
       - bevorzugt 'unit' = 'mm' | 'cm'
-      - falls 'unit_is_mm' gesetzt: True → mm, False → cm
+      - alternativ 'unit_is_mm' (True→mm, False→cm)
     """
     if file.content_type not in (
         "application/sla", "application/octet-stream", "model/stl",
@@ -279,9 +276,8 @@ async def analyze_model(
         raise HTTPException(413, "Datei zu groß (max 50 MB).")
 
     resolved_unit = "mm"
-    if unit:
-        if unit.strip().lower() in ("mm","cm"):
-            resolved_unit = unit.strip().lower()
+    if unit and unit.strip().lower() in ("mm", "cm"):
+        resolved_unit = unit.strip().lower()
     elif unit_is_mm is not None:
         resolved_unit = "mm" if unit_is_mm else "cm"
 
@@ -345,7 +341,7 @@ def weight_direct(req: WeightDirectRequest):
     return WeightResponse(weight_g=round(weight_g, 3))
 
 # -----------------------------
-# NEU: PrusaSlicer – /slice_check
+# PrusaSlicer – /slice_check
 # -----------------------------
 @app.post("/slice_check", response_model=SliceResponse)
 async def slice_check(
@@ -356,11 +352,11 @@ async def slice_check(
     layer_height: float = Form(0.2),
     nozzle: float = Form(0.4),
 ):
-    # --- 0) PrusaSlicer-Binary prüfen (klare Fehlermeldung) ---
+    # 0) Binary prüfen – klare Fehlermeldung statt Traceback
     if not os.path.exists(PRUSASLICER_BIN) and shutil.which(PRUSASLICER_BIN) is None:
         raise HTTPException(500, f"PrusaSlicer nicht gefunden unter: {PRUSASLICER_BIN}")
 
-    # --- 1) Basisschutz & Normalisierung ---
+    # 1) Request validieren
     if file.content_type not in (
         "application/sla","application/octet-stream","model/stl",
         "application/vnd.ms-pki.stl","application/x-stl"
@@ -387,7 +383,7 @@ async def slice_check(
     except: nozzle = 0.4
     nozzle = max(0.2, min(1.0, nozzle))
 
-    # --- 2) Datei speichern ---
+    # 2) Datei speichern & minimalen INI erstellen
     with tempfile.TemporaryDirectory() as td:
         stl_path = os.path.join(td, "model.stl")
         gcode_path = os.path.join(td, "out.gcode")
@@ -396,14 +392,11 @@ async def slice_check(
         raw = await file.read()
         if len(raw) > MAX_FILE_BYTES:
             raise HTTPException(413, "Datei zu groß (max 50 MB).")
-
         with open(stl_path, "wb") as f:
             f.write(raw)
 
-        # --- 3) Optional: Health-Issues (hier leer, kann mit analyze-Checks ergänzt werden)
-        issues = []
+        issues: list = []  # (optional mit analyze-Checks befüllen)
 
-        # --- 4) Minimal-INI generieren ---
         dens = DENSITIES.get(mat, 1.25)
         ini = f"""
 print_settings_id =
@@ -419,10 +412,10 @@ filament_density = {dens}
         with open(cfg_path, "w") as f:
             f.write(ini)
 
-        # --- 5) cm → mm skalieren (vor dem Slicen) ---
+        # 3) cm → mm skalieren (vor dem Slicen)
         scale_arg = ["--scale", "10"] if unit == "cm" else []
 
-        # --- 6) PrusaSlicer aufrufen ---
+        # 4) PrusaSlicer aufrufen
         cmd = [
             PRUSASLICER_BIN,
             "--no-gui",
@@ -445,7 +438,7 @@ filament_density = {dens}
             log.error("PrusaSlicer stderr: %s", res.stderr[:4000])
             raise HTTPException(500, "Slicing fehlgeschlagen.")
 
-        # --- 7) G-Code Header parsen (nur erste ~200 Zeilen) ---
+        # 5) G-Code Header parsen (erste ~200 Zeilen)
         head = ""
         with open(gcode_path, "r", encoding="utf-8", errors="ignore") as g:
             for i, line in zip(range(200), g):
