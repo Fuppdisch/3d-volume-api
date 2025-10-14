@@ -12,12 +12,11 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# ===== Logging (Render zeigt uvicorn.error im Dashboard) =====
+# ===== Logging (Render/uvicorn zeigt diesen Logger im Dashboard) =====
 log = logging.getLogger("uvicorn.error")
 
-# ===== FastAPI-Grundgerüst + CORS =====
-app = FastAPI(title="3D Volume API", version="0.1.0")
-
+# ===== FastAPI + CORS =====
+app = FastAPI(title="3D Volume API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     # TODO: in Produktion auf deine Domains einschränken:
@@ -27,10 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ===== In-Memory Store (für Volumen pro Upload) =====
+# ===== In-Memory Store (für /weight mit model_id) =====
 MODELS: Dict[str, Dict] = {}
 
-# ===== Dichten (g/cm³) fürs Gewicht =====
+# ===== Dichten (g/cm³) =====
 DENSITIES = {
     "PLA": 1.25,
     "PETG": 1.26,
@@ -38,7 +37,7 @@ DENSITIES = {
     "PC":  1.20,
 }
 
-# ===== kleine Helfer =====
+# ===== Helfer =====
 def _round3(x: float) -> float:
     return float(f"{x:.3f}")
 
@@ -55,9 +54,12 @@ def _weight_g(volume_mm3: float, material: str, infill: float) -> float:
     cm3 = volume_mm3 / 1000.0
     return cm3 * DENSITIES[mat] * f
 
-# ===== robuste Mesh-Reparatur über trimesh.repair =====
+# ===== robuste Mesh-Reparatur über trimesh.repair (in-place) =====
 def _repair_mesh(m: trimesh.Trimesh) -> trimesh.Trimesh:
-    """Versionssichere Reparatur ohne m.fill_holes(); alles über trimesh.repair.*"""
+    """
+    Versionssichere Reparatur nur über trimesh.repair.* (kein m.fill_holes()).
+    Arbeitet in-place; alle Fehler werden geloggt, aber nicht als 500 geworfen.
+    """
     try:
         m.remove_duplicate_faces()
         m.remove_degenerate_faces()
@@ -71,35 +73,37 @@ def _repair_mesh(m: trimesh.Trimesh) -> trimesh.Trimesh:
     except Exception as e:
         log.warning(f"fix_normals failed: {e}")
 
-    # füllt kleine Löcher (ändert m in-place; kein Rückgabemesh)
+    # füllt kleine Löcher (ändert m in-place)
     try:
         repair.fill_holes(m)
     except Exception as e:
         log.warning(f"fill_holes failed: {e}")
 
-    # nochmal doppelte/degenerate entfernen
-    try:
-        repair.remove_degenerate_faces(m)
-        repair.remove_duplicate_faces(m)
-    except Exception as e:
-        log.warning(f"repair remove_* failed: {e}")
+    # manche repair-Funktionen sind versionsabhängig; still versuchen
+    for fn_name in ("remove_degenerate_faces", "remove_duplicate_faces"):
+        try:
+            fn = getattr(repair, fn_name, None)
+            if callable(fn):
+                fn(m)
+        except Exception as e:
+            log.warning(f"repair {fn_name} failed: {e}")
 
     try:
-        m.process(validate=True)
+        m.process(validate=True)  # optional (SciPy kann fehlen)
     except Exception as e:
         log.warning(f"process(validate) failed: {e}")
 
     return m
 
-# ===== Voxel-Fallback (mm³) für nicht-wasserdichte Meshes =====
+# ===== Voxel-Fallback (mm³) =====
 def _voxel_fallback_mm3(m: trimesh.Trimesh) -> float:
-    # adaptiver Pitch: ~300 Voxel über die kleinste Dimension, begrenzt 0.05…0.5 mm
+    # adaptiver Pitch: ~300 Voxel über kleinste Dimension, begrenzt 0.05…0.5 mm
     try:
         ext = (m.bounds[1] - m.bounds[0])
         min_dim = float(np.clip(ext, 1e-9, None).min())
         pitch = max(0.05, min(0.5, min_dim / 300.0))
     except Exception:
-        pitch = 0.2  # konservativer Default
+        pitch = 0.2
     try:
         vx = m.voxelized(pitch=pitch)
         solid = vx.fill()
@@ -119,10 +123,10 @@ def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit_is_mm: bool = True) -> 
     if mesh.is_empty:
         raise HTTPException(status_code=400, detail="STL enthält kein gültiges Mesh.")
 
-    # Einheiten: wir erwarten mm (falls nicht, z. B. von m → mm skalieren)
+    # Einheiten-Handling: wir erwarten mm
     if not unit_is_mm:
         try:
-            mesh.apply_scale(1000.0)
+            mesh.apply_scale(1000.0)  # z. B. m → mm
         except Exception as e:
             log.warning(f"apply_scale failed: {e}")
 
@@ -134,7 +138,7 @@ def compute_volume_mm3_from_bytes(stl_bytes: bytes, unit_is_mm: bool = True) -> 
         except Exception as e:
             log.warning(f"mesh.volume failed, fallback to voxel: {e}")
 
-    # Fallback für nicht-dichte oder problematische Meshes
+    # Fallback: robust bei Leaks/offenen Meshes
     return _voxel_fallback_mm3(mesh)
 
 # ===== Pydantic Schemas =====
@@ -151,10 +155,15 @@ class WeightRequest(BaseModel):
 class WeightResponse(BaseModel):
     weight_g: float
 
+class WeightDirectRequest(BaseModel):
+    volume_mm3: float
+    material: str
+    infill: float
+
 # ===== Endpoints =====
 @app.get("/")
 def root():
-    return {"ok": True, "endpoints": ["/docs", "/analyze", "/weight", "/health"]}
+    return {"ok": True, "endpoints": ["/docs", "/analyze", "/weight", "/weight_direct", "/health"]}
 
 @app.get("/health")
 def health():
@@ -184,3 +193,9 @@ async def calc_weight(payload: WeightRequest):
         raise HTTPException(status_code=404, detail="model_id unbekannt oder abgelaufen.")
     g = _weight_g(data["volume_mm3"], payload.material, payload.infill)
     return {"weight_g": _round3(g)}
+
+@app.post("/weight_direct", response_model=WeightResponse)
+async def weight_direct(payload: WeightDirectRequest):
+    g = _weight_g(payload.volume_mm3, payload.material, payload.infill)
+    return {"weight_g": _round3(g)}
+
