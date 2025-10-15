@@ -9,12 +9,12 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Volume API")
 
-# CORS (in Produktion auf deine Domain einschränken)
+# --- CORS (in Produktion auf deine Domain einschränken) -----------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- ENV / Pfade ----
+# --- ENV / Pfade --------------------------------------------------------------
 SLICER_BIN = (
     os.getenv("SLICER_BIN")
     or os.getenv("ORCASLICER_BIN")
@@ -31,30 +31,38 @@ SLICER_BIN = (
     or "/usr/local/bin/orca-slicer"
 )
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-os.environ.setdefault("LD_LIBRARY_PATH", "/opt/orca/usr/lib:/opt/orca/lib:" + os.environ.get("LD_LIBRARY_PATH",""))
-os.environ.setdefault("PATH", "/opt/orca/usr/bin:/opt/orca/bin:" + os.environ.get("PATH",""))
+os.environ.setdefault(
+    "LD_LIBRARY_PATH",
+    "/opt/orca/usr/lib:/opt/orca/lib:" + os.environ.get("LD_LIBRARY_PATH", "")
+)
+os.environ.setdefault(
+    "PATH",
+    "/opt/orca/usr/bin:/opt/orca/bin:" + os.environ.get("PATH", "")
+)
 
 MAX_STL_BYTES = 25 * 1024 * 1024  # 25 MB
-CACHE = {}
+CACHE: dict[str, str] = {}
 
-# ---- Utils ----
+# --- Utils --------------------------------------------------------------------
 def slicer_exists() -> bool:
-    return ((os.path.isfile(SLICER_BIN) and os.access(SLICER_BIN, os.X_OK))
-            or (shutil.which(os.path.basename(SLICER_BIN)) is not None))
+    return (
+        (os.path.isfile(SLICER_BIN) and os.access(SLICER_BIN, os.X_OK))
+        or (shutil.which(os.path.basename(SLICER_BIN)) is not None)
+    )
 
-def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+def run(cmd: list[str], timeout: int = 900) -> tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout or "", p.stderr or ""
 
 def find_profiles() -> dict:
-    """Sucht optionale Profile im Image. Rückgabe: dict mit 'printer','process','filament' (jeweils Liste existierender JSONs)."""
+    """Suche optionale Profile unter /app/profiles/{printers,process,filaments}."""
     base = Path("/app/profiles")
     res = {"printer": [], "process": [], "filament": []}
     if base.exists():
-        for k, sub in [("printer","printers"),("process","process"),("filament","filaments")]:
-            d = base/sub
+        for key, sub in [("printer", "printers"), ("process", "process"), ("filament", "filaments")]:
+            d = base / sub
             if d.exists():
-                res[k] = sorted(str(p) for p in d.glob("*.json"))
+                res[key] = sorted(str(p) for p in d.glob("*.json"))
     return res
 
 def parse_meta_from_gcode(text: str) -> dict:
@@ -67,7 +75,7 @@ def parse_meta_from_gcode(text: str) -> dict:
     if m: meta["filament_g"] = float(m.group(1))
     return meta
 
-# ---- Mini UI auf "/" ----
+# --- Mini UI auf "/" ----------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -117,7 +125,7 @@ def index():
     <label>layer_height</label><input name="layer_height" type="number" step="0.01" value="0.2" style="width:90px">
     <label>nozzle</label><input name="nozzle" type="number" step="0.1" value="0.4" style="width:90px">
     <input type="submit" value="Slicen">
-    <div><small>Optional: Profile unter <code>/app/profiles/{printers,process,filaments}</code> hinterlegen.</small></div>
+    <div><small>Parameter werden derzeit nicht als CLI-Flags erzwungen (Build-Kompatibilität). Nutze Profile unter <code>/app/profiles</code>.</small></div>
   </form>
 </div>
 
@@ -152,7 +160,7 @@ function openDocs(){ window.open(base + '/docs', '_blank'); }
 </script>
 """
 
-# ---- Health & Slicer-Env ----
+# --- Health -------------------------------------------------------------------
 @app.get("/health", response_class=JSONResponse)
 def health():
     return {
@@ -164,6 +172,7 @@ def health():
         "shutil_which": shutil.which(os.path.basename(SLICER_BIN)),
     }
 
+# --- Slicer-Env ---------------------------------------------------------------
 @app.get("/slicer_env", response_class=JSONResponse)
 def slicer_env():
     which = shutil.which(os.path.basename(SLICER_BIN)) or SLICER_BIN
@@ -183,11 +192,11 @@ def slicer_env():
         return {"ok": True, "bin_exists": exists, "which": which, "return_code": code1, "help_snippet": out1}
 
     # 2) xvfb-run Fallback
-    xvfb = shutil.which("xvfb-run")
-    code2, out2 = try_cmd([xvfb or "xvfb-run", "-a", which, "--help"])
+    xvfb = shutil.which("xvfb-run") or "xvfb-run"
+    code2, out2 = try_cmd([xvfb, "-a", which, "--help"])
     return {"ok": True, "bin_exists": exists, "which": which, "return_code": code2, "help_snippet": out2}
 
-# ---- Upload-/Param-Test ----
+# --- Upload/Param-Test --------------------------------------------------------
 @app.post("/slice_check", response_class=JSONResponse)
 async def slice_check(
     file: UploadFile = File(...),
@@ -209,76 +218,75 @@ async def slice_check(
         tmp.write(data); tmp.flush()
         size_bytes = len(data)
     return {
-        "ok": True, "received_bytes": size_bytes,
-        "unit": unit, "material": material.upper(),
-        "infill": float(infill), "layer_height": float(layer_height), "nozzle": float(nozzle),
-        "slicer_bin": SLICER_BIN, "slicer_present": slicer_exists(),
+        "ok": True,
+        "received_bytes": size_bytes,
+        "unit": unit,
+        "material": material.upper(),
+        "infill": float(infill),
+        "layer_height": float(layer_height),
+        "nozzle": float(nozzle),
+        "slicer_bin": SLICER_BIN,
+        "slicer_present": slicer_exists(),
     }
 
-# ---- Echtes Slicen ----
+# --- Echtes Slicen (kompatible Flags) ----------------------------------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
     export_kind: str = Form("3mf"),   # "3mf" | "gcode"
-    infill: float = Form(0.2),
-    layer_height: float = Form(0.2),
-    nozzle: float = Form(0.4),
+    infill: float = Form(0.2),        # Echo only (Build-unabhängig)
+    layer_height: float = Form(0.2),  # Echo only
+    nozzle: float = Form(0.4),        # Echo only
 ):
+    # Basis-Checks
     if not (file.filename or "").lower().endswith(".stl"):
-        raise HTTPException(400, "Nur STL-Dateien werden akzeptiert.")
+        raise HTTPException(status_code=400, detail="Nur STL-Dateien werden akzeptiert.")
     data = await file.read()
     if not data:
-        raise HTTPException(400, "Leere Datei.")
+        raise HTTPException(status_code=400, detail="Leere Datei.")
     if len(data) > MAX_STL_BYTES:
-        raise HTTPException(413, f"Datei > {MAX_STL_BYTES // (1024*1024)} MB.")
+        raise HTTPException(status_code=413, detail=f"Datei > {MAX_STL_BYTES // (1024*1024)} MB.")
 
     work = Path(tempfile.mkdtemp(prefix="slice_"))
-    stl_path = work/"input.stl"; stl_path.write_bytes(data)
-    datadir = work/"cfg"; datadir.mkdir(parents=True, exist_ok=True)  # isolierte Config (headless)
+    stl_path = work / "input.stl"; stl_path.write_bytes(data)
+    datadir = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
+    out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
+    out_3mf = work / "output.3mf"
+    out_gcode = work / "output.gcode"
 
     # optionale Profile auto-laden (falls vorhanden)
     prof = find_profiles()
     load_settings = ";".join((prof["printer"][:1] + prof["process"][:1])) if (prof["printer"] or prof["process"]) else None
     load_filaments = ";".join(prof["filament"][:1]) if prof["filament"] else None
 
-    out_3mf = work/"output.3mf"
-    out_gcode = work/"output.gcode"
-    out_meta = work/"slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
-
-    # CLI zusammenstellen (basierend auf deinem Help)
+    # Minimal-kompatible CLI (ohne Einzel-Overrides)
     cmd = [
         SLICER_BIN,
         "--datadir", str(datadir),
-        "--arrange", "1",
-        "--orient", "1",
-        "--enable-timelapse",            # harmless flag present in help
-        "--debug", "2",
-        "--slice", "0",
+        "--arrange",
+        "--orient",
         "--info",
         "--export-slicedata", str(out_meta),
         stl_path.as_posix(),
     ]
-    if load_settings: cmd += ["--load-settings", load_settings]
+    if load_settings:  cmd += ["--load-settings", load_settings]
     if load_filaments: cmd += ["--load-filaments", load_filaments]
 
-    # Overrides aus Parametern (falls akzeptiert; nicht jede Build nimmt alle)
-    cmd += ["--layer-height", str(layer_height)]
-    cmd += ["--fill-density", str(int(float(infill)*100))]
-    cmd += ["--nozzle-diameter", str(nozzle)]
-
-    # Exportziel
     if export_kind.lower() == "gcode":
         cmd += ["--export-gcode", str(out_gcode)]
     else:
         cmd += ["--export-3mf", str(out_3mf)]
 
-    full_cmd = ["xvfb-run","-a"] + cmd
+    # Einige Builds benötigen explizit --slice (ohne Wert)
+    cmd += ["--slice"]
+
+    # Headless
+    full_cmd = ["xvfb-run", "-a"] + cmd
     code, out, err = run(full_cmd, timeout=900)
     if code != 0:
-        # Orca schreibt oft nur nach stderr – gib den Tail zurück
-        raise HTTPException(500, f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+        raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
-    # Metadaten aus slicedata sammeln
+    # Metadaten sammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
     for jf in out_meta.glob("*.json"):
         try:
@@ -289,21 +297,24 @@ async def slice_model(
         except Exception:
             pass
 
-    # Fallback: G-Code-Header parsen falls nötig
+    # Fallback aus G-Code-Header (falls export_kind=gcode)
     if export_kind.lower() == "gcode" and out_gcode.exists():
         head = out_gcode.read_text(errors="ignore")[:120000]
         meta = {**meta, **{k:v for k,v in parse_meta_from_gcode(head).items() if v is not None}}
 
-    # Ergebnisdatei wählen
-    out_file = out_gcode if export_kind.lower()=="gcode" else out_3mf
+    out_file = out_gcode if export_kind.lower() == "gcode" else out_3mf
     if not out_file.exists() or out_file.stat().st_size == 0:
-        raise HTTPException(500, "Slicing erfolgreich, aber Ausgabedatei fehlt/leer.")
+        raise HTTPException(status_code=500, detail="Slicing erfolgreich, aber Ausgabedatei fehlt/leer.")
 
     return {
         "ok": True,
         "export_kind": export_kind.lower(),
         "out_size_bytes": out_file.stat().st_size,
         "meta": meta,
-        "tips": "Profile optional unter /app/profiles/{printers,process,filaments} einchecken; werden automatisch geladen.",
-        # Wenn du Download anbieten willst, implementiere /download und speichere job_id -> Pfad
+        "echo_params": {
+            "infill_requested": float(infill),
+            "layer_height_requested": float(layer_height),
+            "nozzle_requested": float(nozzle),
+        },
+        "tips": "Für feste Parameter nutze Profile via --load-settings/--load-filaments (unter /app/profiles).",
     }
