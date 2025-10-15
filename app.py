@@ -253,11 +253,11 @@ async def slice_model(
     out_3mf  = work / "output.3mf"
 
     # --- Auto-Fix-Prozessprofil gegen "relative E"-Fehler ---
-    tmp_process = work / "process_fix.json")
+    tmp_process = work / "process_fix.json"
     tmp_process.write_text(json.dumps({
         "name": "auto_relative_e_fix",
         "use_relative_e_distances": False,   # absolute E erzwingen
-        "layer_gcode": "G92 E0\n"            # zusätzlich pro Layer reset
+        "layer_gcode": "G92 E0\n"            # zusätzlich pro Layer reset (unschädlich bei absoluten E)
     }, ensure_ascii=False))
 
     # optionale Profile auto-laden
@@ -274,22 +274,30 @@ async def slice_model(
         if filament_chain:  cmd += ["--load-filaments", ";".join(filament_chain)]
         return cmd
 
-    # --- Export-Matrix ---
+    # --- Export-Matrix + Fallbacks für G-Code-Flag ---
     if export_kind == "gcode":
-        # FIX: einige Orca-Builds kennen --export-gcode nicht -> --gcode -o <file>
-        cmd = base_cmd() + ["--gcode", "-o", str(out_g)]
+        primary = base_cmd() + ["--gcode", "-o", str(out_g)]
+        code, out, err = run(["xvfb-run","-a"] + primary, timeout=900)
+        if code != 0 and ("Invalid option --gcode" in (err or out) or "Unrecognized option '--gcode'" in (err or out)):
+            # Fallback: einige Builds nutzen -g statt --gcode
+            secondary = base_cmd() + ["-g", "-o", str(out_g)]
+            code, out, err = run(["xvfb-run","-a"] + secondary, timeout=900)
+        if code != 0:
+            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
     elif export_kind == "3mf_project":
-        cmd = base_cmd() + ["--export-3mf", str(out_3mf)]                   # ungesliced Projekt
+        cmd = base_cmd() + ["--export-3mf", str(out_3mf)]
+        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
+        if code != 0:
+            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
     elif export_kind == "3mf_sliced":
         if not is_3mf:
             raise HTTPException(400, "3mf_sliced erfordert eine .3mf Eingabedatei.")
-        cmd = base_cmd() + ["--slice", "0", "--export-3mf", str(out_3mf)]   # geslictes 3MF (Platte 0 = alle)
+        cmd = base_cmd() + ["--slice", "0", "--export-3mf", str(out_3mf)]
+        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
+        if code != 0:
+            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
     else:
         raise HTTPException(400, "export_kind muss 'gcode' | '3mf_project' | '3mf_sliced' sein.")
-
-    code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
-    if code != 0:
-        raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
@@ -304,8 +312,8 @@ async def slice_model(
 
     if export_kind == "gcode" and out_g.exists():
         head = out_g.read_text(errors="ignore")[:120000]
-        m2 = parse_meta_from_gcode(head)
-        for k, v in m2.items():
+        from_hdr = parse_meta_from_gcode(head)
+        for k, v in from_hdr.items():
             if v is not None:
                 meta[k] = v
 
@@ -319,5 +327,5 @@ async def slice_model(
         "export_kind": export_kind,
         "out_size_bytes": out_file.stat().st_size,
         "meta": meta,
-        "notes": "Auto-Fix-Prozess aktiv; G-Code via --gcode -o; STL ohne --slice, 3mf_sliced nutzt --slice 0.",
+        "notes": "Auto-Fix-Prozess aktiv; G-Code via --gcode -o (Fallback -g -o); STL ohne --slice; 3mf_sliced nutzt --slice 0.",
     }
