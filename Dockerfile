@@ -8,13 +8,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
-    # generische & kompatible ENV-Variablen, damit bestehender Code weiterläuft
+    # kompatible ENV-Variablen für bestehende Codes
     SLICER_BIN="/usr/local/bin/orca-slicer" \
     PRUSASLICER_BIN="/usr/local/bin/orca-slicer" \
     QT_QPA_PLATFORM="offscreen"
 
-# --- System-/Runtime-Libs für headless GUI/OpenGL + Tools ---------------------
-# WICHTIG: xauth ergänzt, damit xvfb-run funktioniert.
+# --- Systemlibs & X-Stack (xvfb + xauth!) -----------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils squashfs-tools tini \
       # OpenGL / X11 / GTK
@@ -25,9 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libgtk-3-0 libglib2.0-0 libgdk-pixbuf-2.0-0 \
       libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
       xvfb xauth \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/*
 
-# --- OrcaSlicer AppImage entpacken & lauffähig machen -------------------------
+# --- OrcaSlicer AppImage entpacken & verlinken -------------------------------
 RUN set -eux; \
     tmp="/tmp/orca.AppImage"; \
     echo "Lade OrcaSlicer: $ORCA_URL"; \
@@ -35,12 +34,9 @@ RUN set -eux; \
     chmod +x "$tmp"; \
     "$tmp" --appimage-extract; \
     mv squashfs-root /opt/orca; \
-    # Wrapper bereitstellen: ruft das AppImage (AppRun) headless auf
     ln -s /opt/orca/AppRun /usr/local/bin/orca-slicer; \
-    # LD_LIBRARY_PATH hilft, gebündelte Libs zuerst zu finden
     echo 'export LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}"' > /etc/profile.d/orca.sh
 
-# Laufzeit-ENV (für App + Slicer)
 ENV LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}" \
     PATH="/opt/orca/usr/bin:/opt/orca/bin:${PATH}"
 
@@ -52,7 +48,7 @@ COPY app.py .
 
 EXPOSE 8000
 
-# Healthcheck pingt FastAPI
+# Healthcheck pingt die FastAPI
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
 
