@@ -1,10 +1,11 @@
 # ---------- Dockerfile ----------
 FROM python:3.11-slim
 
-# Feste OrcaSlicer-Version (anpassbar per --build-arg)
+# Feste OrcaSlicer-Version (bei Bedarf per --build-arg überschreiben)
 ARG ORCA_URL="https://github.com/SoftFever/OrcaSlicer/releases/download/v2.3.1/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.3.1.AppImage"
 
-ENV PYTHONUNBUFFERED=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000 \
     # generische & kompatible ENV-Variablen, damit bestehender Code weiterläuft
@@ -12,7 +13,8 @@ ENV PYTHONUNBUFFERED=1 \
     PRUSASLICER_BIN="/usr/local/bin/orca-slicer" \
     QT_QPA_PLATFORM="offscreen"
 
-# System-/Runtime-Libs für headless GUI/OpenGL + Tools
+# --- System-/Runtime-Libs für headless GUI/OpenGL + Tools ---------------------
+# WICHTIG: xauth ergänzt, damit xvfb-run funktioniert.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils squashfs-tools tini \
       # OpenGL / X11 / GTK
@@ -21,10 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libxrender1 libxrandr2 libxi6 libxfixes3 libxext6 libxkbcommon0 \
       libdbus-1-3 \
       libgtk-3-0 libglib2.0-0 libgdk-pixbuf-2.0-0 \
-      libpangocairo-1.0-0 libpango-1.0-0 libcairo2 libatk1.0-0 xvfb \
+      libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
+      xvfb xauth \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# OrcaSlicer AppImage entpacken und lauffähig machen
+# --- OrcaSlicer AppImage entpacken & lauffähig machen -------------------------
 RUN set -eux; \
     tmp="/tmp/orca.AppImage"; \
     echo "Lade OrcaSlicer: $ORCA_URL"; \
@@ -37,10 +40,11 @@ RUN set -eux; \
     # LD_LIBRARY_PATH hilft, gebündelte Libs zuerst zu finden
     echo 'export LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}"' > /etc/profile.d/orca.sh
 
+# Laufzeit-ENV (für App + Slicer)
 ENV LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}" \
     PATH="/opt/orca/usr/bin:/opt/orca/bin:${PATH}"
 
-# ---- Python App ---------------------------------------------------
+# --- Python App ---------------------------------------------------------------
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -48,6 +52,7 @@ COPY app.py .
 
 EXPOSE 8000
 
+# Healthcheck pingt FastAPI
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
 
