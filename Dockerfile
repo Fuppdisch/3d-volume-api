@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PRUSASLICER_BIN="/usr/local/bin/orca-slicer" \
     QT_QPA_PLATFORM="offscreen"
 
-# --- Systemlibs, X-Stack, EGL/GLES, GStreamer, typische Qt-X11-Abhängigkeiten ---
+# Systemlibs, X-Stack, EGL/GLES, GStreamer, WebKitGTK (für Qt/Orca), xvfb/xauth
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils squashfs-tools tini \
       # OpenGL / EGL / GLES / DRM
@@ -27,12 +27,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
       # Headless Display
       xvfb xauth \
-      # GStreamer Runtime (Basis)
+      # GStreamer Runtime
       libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
       gstreamer1.0-plugins-base gstreamer1.0-tools \
+      # WebKitGTK + typische Begleiter (für libwebkit2gtk-4.1.so.0)
+      libwebkit2gtk-4.1-0 \
+      libsoup-3.0-0 \
+      libsecret-1-0 \
+      libenchant-2-2 \
+      libharfbuzz-icu0 \
     && rm -rf /var/lib/apt/lists/*
 
-# --- OrcaSlicer AppImage entpacken & verlinken --------------------------------
+# OrcaSlicer AppImage entpacken & verlinken
 RUN set -eux; \
     tmp="/tmp/orca.AppImage"; \
     echo "Lade OrcaSlicer: $ORCA_URL"; \
@@ -47,7 +53,7 @@ RUN set -eux; \
 ENV LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}" \
     PATH="/opt/orca/usr/bin:/opt/orca/bin:${PATH}"
 
-# --- Python App ---------------------------------------------------------------
+# Python App
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -55,6 +61,7 @@ COPY app.py .
 
 EXPOSE 8000
 
+# Healthcheck pingt die FastAPI-Health
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD curl -fsS http://127.0.0.1:${PORT}/health || exit 1
 
