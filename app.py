@@ -229,7 +229,7 @@ async def slice_check(
         "slicer_present": slicer_exists(),
     }
 
-# --- Echtes Slicen (minimal-kompatibel: ohne arrange/orient) ------------------
+# --- Echtes Slicen (tries --slice 1, then without) ----------------------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
@@ -259,30 +259,34 @@ async def slice_model(
     load_settings  = ";".join((prof["printer"][:1] + prof["process"][:1])) if (prof["printer"] or prof["process"]) else None
     load_filaments = ";".join(prof["filament"][:1]) if prof["filament"] else None
 
-    # Minimal-kompatible CLI (ohne arrange/orient/overrides)
-    cmd = [
-        SLICER_BIN,
-        "--datadir", str(datadir),
-        "--info",
-        "--export-slicedata", str(out_meta),
-        stl_path.as_posix(),
-    ]
-    if load_settings:  cmd += ["--load-settings", load_settings]
-    if load_filaments: cmd += ["--load-filaments", load_filaments]
+    def base_cmd():
+        cmd = [
+            SLICER_BIN,
+            "--datadir", str(datadir),
+            "--info",
+            "--export-slicedata", str(out_meta),
+            stl_path.as_posix(),
+        ]
+        if load_settings:  cmd += ["--load-settings", load_settings]
+        if load_filaments: cmd += ["--load-filaments", load_filaments]
+        if export_kind.lower() == "gcode":
+            cmd += ["--export-gcode", str(out_gcode)]
+        else:
+            cmd += ["--export-3mf", str(out_3mf)]
+        return cmd
 
-    if export_kind.lower() == "gcode":
-        cmd += ["--export-gcode", str(out_gcode)]
-    else:
-        cmd += ["--export-3mf", str(out_3mf)]
+    # Versuch A: mit --slice 1
+    cmdA = base_cmd() + ["--slice", "1"]
+    code, out, err = run(["xvfb-run","-a"] + cmdA, timeout=900)
 
-    # Einige Builds brauchen explizit --slice (ohne Wert)
-    cmd += ["--slice"]
+    # Fallback B: ohne --slice (manche Builds slicen beim Export automatisch)
+    if code != 0 and ("Need values for option --slice" in (err or out) or
+                      "Invalid value for option --slice" in (err or out) or
+                      "Unknown option --slice" in (err or out)):
+        cmdB = base_cmd()  # kein --slice
+        code, out, err = run(["xvfb-run","-a"] + cmdB, timeout=900)
 
-    # Headless
-    full_cmd = ["xvfb-run", "-a"] + cmd
-    code, out, err = run(full_cmd, timeout=900)
     if code != 0:
-        # hilfreicher Tail
         raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
@@ -296,6 +300,7 @@ async def slice_model(
         except Exception:
             pass
 
+    # G-Code-Header als Fallback (nur bei gcode)
     if export_kind.lower() == "gcode" and out_gcode.exists():
         head = out_gcode.read_text(errors="ignore")[:120000]
         from_meta = parse_meta_from_gcode(head)
@@ -317,5 +322,5 @@ async def slice_model(
             "layer_height_requested": float(layer_height),
             "nozzle_requested": float(nozzle),
         },
-        "notes": "Minimal-CLI genutzt (ohne --arrange/--orient). Für feste Parameter nutze Profile via --load-settings/--load-filaments.",
+        "notes": "Automatischer Fallback: erst '--slice 1', sonst ohne '--slice'. Für feste Parameter nutze Profile via --load-settings/--load-filaments.",
     }
