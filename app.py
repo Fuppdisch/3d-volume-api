@@ -1,23 +1,22 @@
 # ---------- app.py ----------
-import os, shutil, tempfile, subprocess
+import os, shutil, tempfile, subprocess, json
 from typing import Optional
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Volume API")
 
-# CORS – passe origins an deine Domains an (oder "*" für schnelles Testen)
+# CORS freischalten (für deinen Web-Kalkulator). In Prod: Domains einschränken!
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # TODO: produktiv restriktiver setzen
+    allow_origins=["*"],      # TODO: auf deine Domain begrenzen
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# bevorzugte/kompatible ENV-Variablen
+# bevorzugte/kompatible ENV-Variablen (Dockerfile setzt SLICER_BIN)
 SLICER_BIN = (
     os.getenv("SLICER_BIN")
     or os.getenv("ORCASLICER_BIN")
@@ -25,13 +24,13 @@ SLICER_BIN = (
     or "/usr/local/bin/orca-slicer"
 )
 
-# Headless/GL-Setup
+# Headless/GL-Env (wird im Dockerfile ebenfalls gesetzt, hier als Fallback)
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("LD_LIBRARY_PATH", "/opt/orca/usr/lib:/opt/orca/lib:" + os.environ.get("LD_LIBRARY_PATH",""))
 os.environ.setdefault("PATH", "/opt/orca/usr/bin:/opt/orca/bin:" + os.environ.get("PATH",""))
 
 CACHE = {}
-MAX_STL_BYTES = 25 * 1024 * 1024  # 25 MB Upload-Limit für Tests
+MAX_STL_BYTES = 25 * 1024 * 1024  # 25 MB
 
 def slicer_exists() -> bool:
     return (os.path.isfile(SLICER_BIN) and os.access(SLICER_BIN, os.X_OK)) or \
@@ -54,17 +53,14 @@ def health():
 
 @app.get("/slicer_env", response_class=JSONResponse)
 def slicer_env():
-    """Kleiner Reality-Check: ist die Binary vorhanden & startbar?"""
+    """Reality-Check: ist Orca startbar? (--help via xvfb-run)"""
     which = shutil.which(os.path.basename(SLICER_BIN))
     exists = slicer_exists()
     help_out: Optional[str] = None
     code: Optional[int] = None
     try:
-        # Viele AppImages liefern Hilfe nur auf stderr – wir sammeln beides
-        p = subprocess.run(
-            [which or SLICER_BIN, "--help"],
-            capture_output=True, text=True, timeout=8
-        )
+        cmd = ["xvfb-run","-a", which or SLICER_BIN, "--help"]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         code = p.returncode
         help_out = (p.stdout or p.stderr or "")[:2000]
     except Exception as e:
@@ -82,11 +78,9 @@ async def slice_check(
 ):
     """
     Reiner Upload-/Parameter-Test:
-    - nimmt STL entgegen,
-    - prüft Größe/Endung,
-    - speichert temporär,
-    - gibt Echo/Meta zurück.
-    Noch KEIN echtes Slicen – das hängen wir danach dran.
+    - nimmt STL entgegen, prüft Größe/Endung
+    - speichert kurz temporär (Proof of Upload)
+    - gibt Echo/Meta zurück
     """
     fname = (file.filename or "").lower()
     if not fname.endswith(".stl"):
@@ -98,13 +92,10 @@ async def slice_check(
     if len(data) > MAX_STL_BYTES:
         raise HTTPException(status_code=413, detail=f"Datei > {MAX_STL_BYTES//(1024*1024)} MB.")
 
-    # Temporär speichern – beweist, dass Upload & FS gehen
     with tempfile.NamedTemporaryFile(delete=True, suffix=".stl") as tmp:
-        tmp.write(data)
-        tmp.flush()
+        tmp.write(data); tmp.flush()
         size_bytes = len(data)
 
-    # Noch kein Slicen – nur positive Bestätigung
     return {
         "ok": True,
         "received_bytes": size_bytes,
