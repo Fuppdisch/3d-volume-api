@@ -6,7 +6,6 @@ import shutil
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -229,7 +228,7 @@ async def slice_check(
         "slicer_present": slicer_exists(),
     }
 
-# --- Echtes Slicen (tries --slice 1, then without) ----------------------------
+# --- Echtes Slicen: probiert mehrere --slice-Varianten + Fallback ------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
@@ -275,19 +274,39 @@ async def slice_model(
             cmd += ["--export-3mf", str(out_3mf)]
         return cmd
 
-    # Versuch A: mit --slice 1
-    cmdA = base_cmd() + ["--slice", "1"]
-    code, out, err = run(["xvfb-run","-a"] + cmdA, timeout=900)
+    # Kandidaten für --slice-Werte (verschiedene Syntaxen)
+    slice_variants = [
+        ["--slice=1"],
+        ["--slice", "1"],
+        ["--slice=true"],
+        ["--slice", "true"],
+        ["--slice=on"],
+        ["--slice", "on"],
+        ["--slice=yes"],
+        ["--slice", "yes"],
+    ]
 
-    # Fallback B: ohne --slice (manche Builds slicen beim Export automatisch)
-    if code != 0 and ("Need values for option --slice" in (err or out) or
-                      "Invalid value for option --slice" in (err or out) or
-                      "Unknown option --slice" in (err or out)):
-        cmdB = base_cmd()  # kein --slice
-        code, out, err = run(["xvfb-run","-a"] + cmdB, timeout=900)
+    last_err = ""
+    # 1) Durchprobieren
+    for variant in slice_variants:
+        cmd = base_cmd() + variant
+        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
+        if code == 0:
+            break
+        last_err = (err or out)
+        if not any(tok in (err or out) for tok in [
+            "Need values for option --slice",
+            "Invalid value for option --slice",
+            "Unknown option --slice",
+            "Unrecognized option '--slice'",
+        ]):
+            raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {last_err[-1000:]}")
 
-    if code != 0:
-        raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+    else:
+        # 2) Fallback: ganz ohne --slice (manche Builds slicen beim Export)
+        code, out, err = run(["xvfb-run","-a"] + base_cmd(), timeout=900)
+        if code != 0:
+            raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
@@ -322,5 +341,5 @@ async def slice_model(
             "layer_height_requested": float(layer_height),
             "nozzle_requested": float(nozzle),
         },
-        "notes": "Automatischer Fallback: erst '--slice 1', sonst ohne '--slice'. Für feste Parameter nutze Profile via --load-settings/--load-filaments.",
+        "notes": "Mehrere --slice-Formate durchprobiert; falls nötig ohne --slice exportiert.",
     }
