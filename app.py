@@ -104,27 +104,29 @@ def index():
 <div class="card">
   <h3 style="margin-top:0">Upload-Test (<code>/slice_check</code>)</h3>
   <form id="f1" onsubmit="return sendSliceCheck(event)">
-    <input type="file" name="file" accept=".stl" required>
+    <input type="file" name="file" accept=".stl,.3mf" required>
     <label>unit</label><select name="unit"><option>mm</option><option>cm</option></select>
     <label>material</label><select name="material"><option>PLA</option><option>PETG</option><option>ASA</option><option>PC</option></select>
     <label>infill</label><input name="infill" type="number" step="0.01" value="0.2" style="width:90px">
     <label>layer_height</label><input name="layer_height" type="number" step="0.01" value="0.2" style="width:90px">
     <label>nozzle</label><input name="nozzle" type="number" step="0.1" value="0.4" style="width:90px">
     <input type="submit" value="Hochladen & prüfen">
-    <div><small>Max. 25 MB • akzeptiert: .stl</small></div>
+    <div><small>Max. 25 MB • akzeptiert: .stl, .3mf</small></div>
   </form>
 </div>
 
 <div class="card">
   <h3 style="margin-top:0">Echt slicen (<code>/slice</code>)</h3>
   <form id="f2" onsubmit="return sendSlice(event)">
-    <input type="file" name="file" accept=".stl" required>
-    <label>export_kind</label><select name="export_kind"><option>3mf</option><option>gcode</option></select>
-    <label>infill</label><input name="infill" type="number" step="0.01" value="0.2" style="width:90px">
-    <label>layer_height</label><input name="layer_height" type="number" step="0.01" value="0.2" style="width:90px">
-    <label>nozzle</label><input name="nozzle" type="number" step="0.1" value="0.4" style="width:90px">
+    <input type="file" name="file" accept=".stl,.3mf" required>
+    <label>export_kind</label>
+    <select name="export_kind">
+      <option value="gcode">G-Code (.gcode)</option>
+      <option value="3mf_project">3MF-Projekt (ungesliced)</option>
+      <option value="3mf_sliced">3MF (gesliced, nur bei 3MF Input)</option>
+    </select>
     <input type="submit" value="Slicen">
-    <div><small>Parameter werden derzeit nicht als CLI-Flags erzwungen (Build-Kompatibilität). Nutze Profile unter <code>/app/profiles</code>.</small></div>
+    <div><small>STL: am besten G-Code wählen. 3MF_sliced setzt --slice 0.</small></div>
   </form>
 </div>
 
@@ -206,19 +208,16 @@ async def slice_check(
     nozzle: float = Form(0.4),
 ):
     fname = (file.filename or "").lower()
-    if not fname.endswith(".stl"):
-        raise HTTPException(status_code=400, detail="Nur STL-Dateien werden akzeptiert.")
+    if not (fname.endswith(".stl") or fname.endswith(".3mf")):
+        raise HTTPException(status_code=400, detail="Nur STL- oder 3MF-Dateien werden akzeptiert.")
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Leere Datei.")
     if len(data) > MAX_STL_BYTES:
         raise HTTPException(status_code=413, detail=f"Datei > {MAX_STL_BYTES // (1024*1024)} MB.")
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".stl") as tmp:
-        tmp.write(data); tmp.flush()
-        size_bytes = len(data)
     return {
         "ok": True,
-        "received_bytes": size_bytes,
+        "received_bytes": len(data),
         "unit": unit,
         "material": material.upper(),
         "infill": float(infill),
@@ -228,85 +227,68 @@ async def slice_check(
         "slicer_present": slicer_exists(),
     }
 
-# --- Echtes Slicen: probiert mehrere --slice-Varianten + Fallback ------------
+# --- Echtes Slicen: Auto-Fix-Prozess + robuste Export-Matrix ------------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
-    export_kind: str = Form("3mf"),   # "3mf" | "gcode"
-    infill: float = Form(0.2),        # Echo only
-    layer_height: float = Form(0.2),  # Echo only
-    nozzle: float = Form(0.4),        # Echo only
+    export_kind: str = Form("gcode"),  # "gcode" | "3mf_project" | "3mf_sliced"
 ):
-    # Basis-Checks
-    if not (file.filename or "").lower().endswith(".stl"):
-        raise HTTPException(status_code=400, detail="Nur STL-Dateien werden akzeptiert.")
+    name = (file.filename or "").lower()
+    if not (name.endswith(".stl") or name.endswith(".3mf")):
+        raise HTTPException(400, "Nur STL- oder 3MF-Dateien werden akzeptiert.")
     data = await file.read()
     if not data:
-        raise HTTPException(status_code=400, detail="Leere Datei.")
+        raise HTTPException(400, "Leere Datei.")
     if len(data) > MAX_STL_BYTES:
-        raise HTTPException(status_code=413, detail=f"Datei > {MAX_STL_BYTES // (1024*1024)} MB.")
+        raise HTTPException(413, f"Datei > {MAX_STL_BYTES // (1024*1024)} MB.")
 
     work = Path(tempfile.mkdtemp(prefix="slice_"))
-    stl_path = work / "input.stl"; stl_path.write_bytes(data)
-    datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
-    out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
-    out_3mf  = work / "output.3mf"
-    out_gcode= work / "output.gcode"
+    is_3mf = name.endswith(".3mf")
+    inp = work / ("input.3mf" if is_3mf else "input.stl")
+    inp.write_bytes(data)
 
-    # optionale Profile auto-laden (falls vorhanden)
+    datadir  = work / "cfg";       datadir.mkdir(parents=True, exist_ok=True)
+    out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
+    out_g    = work / "output.gcode"
+    out_3mf  = work / "output.3mf"
+
+    # --- Auto-Fix-Prozessprofil gegen "relative E"-Fehler ---
+    tmp_process = work / "process_fix.json"
+    tmp_process.write_text(json.dumps({
+        "name": "auto_relative_e_fix",
+        "use_relative_e_distances": False,   # absolute E erzwingen
+        "layer_gcode": "G92 E0\n"            # zusätzlich pro Layer reset (unschädlich bei absoluten E)
+    }, ensure_ascii=False))
+
+    # optionale Profile auto-laden
     prof = find_profiles()
-    load_settings  = ";".join((prof["printer"][:1] + prof["process"][:1])) if (prof["printer"] or prof["process"]) else None
-    load_filaments = ";".join(prof["filament"][:1]) if prof["filament"] else None
+    settings_chain = [str(tmp_process)]
+    if prof.get("printer"):  settings_chain.append(prof["printer"][0])
+    if prof.get("process"):  settings_chain.append(prof["process"][0])
+    filament_chain = []
+    if prof.get("filament"): filament_chain.append(prof["filament"][0])
 
     def base_cmd():
-        cmd = [
-            SLICER_BIN,
-            "--datadir", str(datadir),
-            "--info",
-            "--export-slicedata", str(out_meta),
-            stl_path.as_posix(),
-        ]
-        if load_settings:  cmd += ["--load-settings", load_settings]
-        if load_filaments: cmd += ["--load-filaments", load_filaments]
-        if export_kind.lower() == "gcode":
-            cmd += ["--export-gcode", str(out_gcode)]
-        else:
-            cmd += ["--export-3mf", str(out_3mf)]
+        cmd = [SLICER_BIN, "--datadir", str(datadir), "--info", "--export-slicedata", str(out_meta), inp.as_posix()]
+        if settings_chain:  cmd += ["--load-settings", ";".join(settings_chain)]
+        if filament_chain:  cmd += ["--load-filaments", ";".join(filament_chain)]
         return cmd
 
-    # Kandidaten für --slice-Werte (verschiedene Syntaxen)
-    slice_variants = [
-        ["--slice=1"],
-        ["--slice", "1"],
-        ["--slice=true"],
-        ["--slice", "true"],
-        ["--slice=on"],
-        ["--slice", "on"],
-        ["--slice=yes"],
-        ["--slice", "yes"],
-    ]
-
-    last_err = ""
-    # 1) Durchprobieren
-    for variant in slice_variants:
-        cmd = base_cmd() + variant
-        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
-        if code == 0:
-            break
-        last_err = (err or out)
-        if not any(tok in (err or out) for tok in [
-            "Need values for option --slice",
-            "Invalid value for option --slice",
-            "Unknown option --slice",
-            "Unrecognized option '--slice'",
-        ]):
-            raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {last_err[-1000:]}")
-
+    # --- Export-Matrix (ohne arrange/orient, ohne overrides) ---
+    if export_kind == "gcode":
+        cmd = base_cmd() + ["--export-gcode", str(out_g)]                   # slict implizit
+    elif export_kind == "3mf_project":
+        cmd = base_cmd() + ["--export-3mf", str(out_3mf)]                   # ungesliced Projekt
+    elif export_kind == "3mf_sliced":
+        if not is_3mf:
+            raise HTTPException(400, "3mf_sliced erfordert eine .3mf Eingabedatei.")
+        cmd = base_cmd() + ["--slice", "0", "--export-3mf", str(out_3mf)]   # geslictes 3MF (Platte 0 = alle)
     else:
-        # 2) Fallback: ganz ohne --slice (manche Builds slicen beim Export)
-        code, out, err = run(["xvfb-run","-a"] + base_cmd(), timeout=900)
-        if code != 0:
-            raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+        raise HTTPException(400, "export_kind muss 'gcode' | '3mf_project' | '3mf_sliced' sein.")
+
+    code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
+    if code != 0:
+        raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
@@ -319,27 +301,22 @@ async def slice_model(
         except Exception:
             pass
 
-    # G-Code-Header als Fallback (nur bei gcode)
-    if export_kind.lower() == "gcode" and out_gcode.exists():
-        head = out_gcode.read_text(errors="ignore")[:120000]
-        from_meta = parse_meta_from_gcode(head)
-        for k, v in from_meta.items():
+    if export_kind == "gcode" and out_g.exists():
+        head = out_g.read_text(errors="ignore")[:120000]
+        from_hdr = parse_meta_from_gcode(head)
+        for k, v in from_hdr.items():
             if v is not None:
                 meta[k] = v
 
-    out_file = out_gcode if export_kind.lower() == "gcode" else out_3mf
+    out_file = {"gcode": out_g, "3mf_project": out_3mf, "3mf_sliced": out_3mf}[export_kind]
     if not out_file.exists() or out_file.stat().st_size == 0:
-        raise HTTPException(status_code=500, detail="Slicing erfolgreich, aber Ausgabedatei fehlt/leer.")
+        raise HTTPException(500, "Slicing erfolgreich, aber Ausgabedatei fehlt/leer.")
 
     return {
         "ok": True,
-        "export_kind": export_kind.lower(),
+        "input_ext": ".3mf" if is_3mf else ".stl",
+        "export_kind": export_kind,
         "out_size_bytes": out_file.stat().st_size,
         "meta": meta,
-        "echo_params": {
-            "infill_requested": float(infill),
-            "layer_height_requested": float(layer_height),
-            "nozzle_requested": float(nozzle),
-        },
-        "notes": "Mehrere --slice-Formate durchprobiert; falls nötig ohne --slice exportiert.",
+        "notes": "Auto-Fix-Prozess aktiv; STL ohne --slice, 3mf_sliced nutzt --slice 0.",
     }
