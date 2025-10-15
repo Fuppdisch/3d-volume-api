@@ -229,7 +229,7 @@ async def slice_check(
         "slicer_present": slicer_exists(),
     }
 
-# --- Echtes Slicen (robust: arrange/orient mit Fallback) ----------------------
+# --- Echtes Slicen (minimal-kompatibel: ohne arrange/orient) ------------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
@@ -259,41 +259,33 @@ async def slice_model(
     load_settings  = ";".join((prof["printer"][:1] + prof["process"][:1])) if (prof["printer"] or prof["process"]) else None
     load_filaments = ";".join(prof["filament"][:1]) if prof["filament"] else None
 
-    def make_cmd(arrange_with_values: bool):
-        base = [
-            SLICER_BIN,
-            "--datadir", str(datadir),
-            "--info",
-            "--export-slicedata", str(out_meta),
-            stl_path.as_posix(),
-        ]
-        if arrange_with_values:
-            base += ["--arrange", "1", "--orient", "1"]
-        else:
-            base += ["--arrange", "--orient"]
-        if load_settings:  base += ["--load-settings", load_settings]
-        if load_filaments: base += ["--load-filaments", load_filaments]
-        if export_kind.lower() == "gcode":
-            base += ["--export-gcode", str(out_gcode)]
-        else:
-            base += ["--export-3mf", str(out_3mf)]
-        base += ["--slice"]  # ohne Wert
-        return ["xvfb-run","-a"] + base
+    # Minimal-kompatible CLI (ohne arrange/orient/overrides)
+    cmd = [
+        SLICER_BIN,
+        "--datadir", str(datadir),
+        "--info",
+        "--export-slicedata", str(out_meta),
+        stl_path.as_posix(),
+    ]
+    if load_settings:  cmd += ["--load-settings", load_settings]
+    if load_filaments: cmd += ["--load-filaments", load_filaments]
 
-    # 1) Versuch: mit Werten (CLI erwartet häufig 1/0)
-    cmd = make_cmd(arrange_with_values=True)
-    code, out, err = run(cmd, timeout=900)
+    if export_kind.lower() == "gcode":
+        cmd += ["--export-gcode", str(out_gcode)]
+    else:
+        cmd += ["--export-3mf", str(out_3mf)]
 
-    # 2) Fallback: ohne Werte, falls diese Build reine Flags erwartet
-    if code != 0 and ("Invalid value for option --arrange" in (err or out) or
-                      "Invalid value for option --orient"  in (err or out)):
-        cmd = make_cmd(arrange_with_values=False)
-        code, out, err = run(cmd, timeout=900)
+    # Einige Builds brauchen explizit --slice (ohne Wert)
+    cmd += ["--slice"]
 
+    # Headless
+    full_cmd = ["xvfb-run", "-a"] + cmd
+    code, out, err = run(full_cmd, timeout=900)
     if code != 0:
+        # hilfreicher Tail
         raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
-    # Metadaten sammeln
+    # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
     for jf in out_meta.glob("*.json"):
         try:
@@ -304,10 +296,12 @@ async def slice_model(
         except Exception:
             pass
 
-    # G-Code-Header als Fallback-Quelle (nur bei gcode)
     if export_kind.lower() == "gcode" and out_gcode.exists():
         head = out_gcode.read_text(errors="ignore")[:120000]
-        meta = {**meta, **{k: v for k, v in parse_meta_from_gcode(head).items() if v is not None}}
+        from_meta = parse_meta_from_gcode(head)
+        for k, v in from_meta.items():
+            if v is not None:
+                meta[k] = v
 
     out_file = out_gcode if export_kind.lower() == "gcode" else out_3mf
     if not out_file.exists() or out_file.stat().st_size == 0:
@@ -323,5 +317,5 @@ async def slice_model(
             "layer_height_requested": float(layer_height),
             "nozzle_requested": float(nozzle),
         },
-        "notes": "arrange/orient werden automatisch je nach Build als Flag oder mit Wert verwendet. Parameterüberschreibungen bitte über Profile via --load-settings/--load-filaments.",
+        "notes": "Minimal-CLI genutzt (ohne --arrange/--orient). Für feste Parameter nutze Profile via --load-settings/--load-filaments.",
     }
