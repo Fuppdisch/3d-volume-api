@@ -1,65 +1,55 @@
-# ------------------------------------------------------------
-# Base
-# ------------------------------------------------------------
+# ---- Base ---------------------------------------------------------
 FROM python:3.11-slim
 
-# Allgemeine Python-Umgebung
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+# Konfigurierbare PrusaSlicer-Version (bei Bedarf im Render-UI als Build Arg setzen)
+ARG PRUSA_VERSION=2.7.4
 
-# Uvicorn/HTTP-Port (Render erkennt das automatisch)
-ENV PORT=8000
+# Basis-ENV
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PRUSASLICER_BIN="/opt/prusaslicer/usr/bin/prusa-slicer"
 
-# ------------------------------------------------------------
-# System-Pakete: curl + AppImage-Tools + PrusaSlicer-Runtime-Libs
-# ------------------------------------------------------------
+# Nützliche Tools + SquashFS für AppImage-Extraction
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl xz-utils squashfs-tools tini \
-    # --- RUNTIME LIBS FÜR PRUSASLICER (Headless/GTK/OpenGL/X11) ---
-    libgtk-3-0 libglib2.0-0 libgdk-pixbuf-2.0-0 libpangocairo-1.0-0 \
-    libpango-1.0-0 libcairo2 libatk1.0-0 libx11-6 libx11-xcb1 libxcb1 \
-    libxcb-shm0 libxcb-render0 libxrender1 libxrandr2 libxi6 libxfixes3 \
-    libxext6 libxkbcommon0 libdbus-1-3 libglu1-mesa libgl1 libopengl0 \
- && apt-get clean && rm -rf /var/lib/apt/lists/*
+      ca-certificates curl xz-utils squashfs-tools tini \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ------------------------------------------------------------
-# PrusaSlicer installieren (AppImage entpacken)
-# ------------------------------------------------------------
-ARG PS_VERSION=2.7.2
-RUN curl -L -o /tmp/prusaslicer.AppImage \
-      "https://github.com/prusa3d/PrusaSlicer/releases/download/version_${PS_VERSION}/PrusaSlicer-${PS_VERSION}+linux-x64-GTK3.AppImage" \
- && chmod +x /tmp/prusaslicer.AppImage \
- && /tmp/prusaslicer.AppImage --appimage-extract \
- && mv squashfs-root /opt/prusaslicer \
- && rm -f /tmp/prusaslicer.AppImage
+# ---- PrusaSlicer installieren (AppImage extrahieren) --------------
+# Versucht zuerst GTK3-Asset. Falls es die Datei-Namen leicht anders sind,
+# fallback auf “GTK2”. (curl -fSL … || curl -fSL …)
+RUN set -eux; \
+    tmp="/tmp/ps.AppImage"; \
+    (curl -fSL -o "$tmp" \
+        "https://github.com/prusa3d/PrusaSlicer/releases/download/version_${PRUSA_VERSION}/PrusaSlicer-${PRUSA_VERSION}+linux-x64-GTK3.AppImage" \
+     || curl -fSL -o "$tmp" \
+        "https://github.com/prusa3d/PrusaSlicer/releases/download/version_${PRUSA_VERSION}/PrusaSlicer-${PRUSA_VERSION}+linux-x64-GTK2.AppImage"); \
+    chmod +x "$tmp"; \
+    "$tmp" --appimage-extract; \
+    mv squashfs-root /opt/prusaslicer; \
+    rm -f "$tmp"
 
-# Pfad zur Binärdatei für die App bekannt machen
-ENV PRUSASLICER_BIN=/opt/prusaslicer/usr/bin/prusa-slicer
+# Bin in den PATH
+ENV PATH="/opt/prusaslicer/usr/bin:${PATH}"
 
-# ------------------------------------------------------------
-# App-Code & Python-Abhängigkeiten
-# ------------------------------------------------------------
+# ---- Python App ---------------------------------------------------
 WORKDIR /app
 
-# zuerst nur requirements, damit Docker-Layer gecacht werden können
+# Abhängigkeiten
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# jetzt den Code
+# App-Code
 COPY app.py .
 
-# ------------------------------------------------------------
-# Laufzeit
-# ------------------------------------------------------------
+# ---- Runtime ------------------------------------------------------
 EXPOSE 8000
 
-# kleiner Healthcheck (optional – Render hat eigenen Healthcheck, schadet aber nicht)
-HEALTHCHECK --interval=30s --timeout=5s --retries=5 CMD \
-  curl -fsS http://127.0.0.1:${PORT}/health || exit 1
+# Healthcheck spricht deinen /health-Endpoint an
+HEALTHCHECK --interval=30s --timeout=3s --retries=5 \
+  CMD curl -fsS http://localhost:8000/health || exit 1
 
-# Tini als Init-Prozess (sauberes Signal-Handling)
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Tini als PID1 (sauberes Signal-Handling)
+ENTRYPOINT ["/usr/bin/tini","--"]
 
 # Uvicorn starten
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000"]
