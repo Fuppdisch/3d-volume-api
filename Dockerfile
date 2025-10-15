@@ -1,5 +1,5 @@
-# ---- Base (Debian/Ubuntu-Familie) --------------------------------
-FROM python:3.11-slim
+# ---- Base (Alpine) -----------------------------------------------
+FROM python:3.11-alpine
 
 ARG PRUSA_VERSION=2.7.4
 
@@ -7,26 +7,19 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8000
 
-# ---- System-Libs (inkl. Fix aus "So fixt du das Deploy") ----------
-# - libGL & Freunde gegen "libGL.so.1 missing"
-# - zusätzliche Laufzeitlibs für PrusaSlicer AppImage
-RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      # Basis
-      ca-certificates curl xz-utils squashfs-tools tini \
-      # "So fixt du das Deploy" Kernpakete
-      libgl1 libglu1-mesa libxext6 libxrender1 libglib2.0-0 \
-      # weitere X11/GL/GTK-Libs für PrusaSlicer
-      libopengl0 \
-      libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxcb-render0 \
-      libxrandr2 libxi6 libxfixes3 libxkbcommon0 \
-      libdbus-1-3 \
-      libgtk-3-0 libgdk-pixbuf-2.0-0 \
-      libpangocairo-1.0-0 libpango-1.0-0 libcairo2 libatk1.0-0 \
-    && rm -rf /var/lib/apt/lists/*
+# ---- System-Libs (inkl. Fix für Alpine) --------------------------
+# Kernpakete für OpenGL/X11/GTK + Tools zum Entpacken der AppImage
+RUN apk add --no-cache \
+    ca-certificates curl xz squashfs-tools tini \
+    # "So fixt du das Deploy" Kernlibs
+    mesa-gl mesa-glu libxext libxrender glib \
+    # weitere Laufzeitlibs für PrusaSlicer
+    mesa \
+    libx11 libxcb libxrandr libxi libxfixes libxkbcommon \
+    dbus-libs \
+    gtk+3 gdk-pixbuf pango cairo atk
 
 # ---- PrusaSlicer AppImage entpacken -------------------------------
-# Nimmt GTK3, fällt bei Bedarf auf GTK2 zurück
 RUN set -eux; \
     tmp="/tmp/prusaslicer.AppImage"; \
     (curl -fSL -o "$tmp" \
@@ -38,33 +31,36 @@ RUN set -eux; \
     mv squashfs-root /opt/prusaslicer; \
     rm -f "$tmp"
 
-# Wichtig: echter Binary-Pfad
-ENV PRUSASLICER_BIN="/opt/prusaslicer/bin/prusa-slicer"
-
-# Optional: Libpfad & Offscreen-Rendering (zieht kein DISPLAY)
-ENV LD_LIBRARY_PATH="/opt/prusaslicer/usr/lib:/opt/prusaslicer/lib:${LD_LIBRARY_PATH}" \
+# Wichtige Pfade/Env
+ENV PRUSASLICER_BIN="/opt/prusaslicer/bin/prusa-slicer" \
+    LD_LIBRARY_PATH="/opt/prusaslicer/usr/lib:/opt/prusaslicer/lib:${LD_LIBRARY_PATH}" \
     QT_QPA_PLATFORM="offscreen" \
     PATH="/opt/prusaslicer/bin:/opt/prusaslicer/usr/bin:${PATH}"
 
 # ---- Python App ---------------------------------------------------
 WORKDIR /app
+
+# (Optional) Build-Tools nur temporär, falls Wheels gebaut werden müssen
+# Entferne den Block, wenn deine requirements reine Wheels sind.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apk add --no-cache --virtual .build-deps \
+      build-base linux-headers python3-dev && \
+    pip install --no-cache-dir -r requirements.txt && \
+    apk del .build-deps
 
 # Dein API Code (muss /health bedienen)
 COPY app.py .
 
-# Sicherheit: Non-root
-RUN useradd -m worker && chown -R worker:worker /app
+# Non-root User
+RUN adduser -D -h /app worker && chown -R worker:worker /app
 USER worker
 
 # ---- Netzwerk/Health ---------------------------------------------
 EXPOSE 8000
-
 HEALTHCHECK --interval=30s --timeout=5s --retries=5 \
   CMD curl -fsS "http://127.0.0.1:${PORT}/health" || exit 1
 
 # ---- Start --------------------------------------------------------
-# Render setzt $PORT – wir benutzen tini als PID 1
-ENTRYPOINT ["/usr/bin/tini","--"]
+# In Alpine liegt tini üblicherweise unter /sbin/tini
+ENTRYPOINT ["/sbin/tini","--"]
 CMD ["uvicorn","app:app","--host","0.0.0.0","--port","8000"]
