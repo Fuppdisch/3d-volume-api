@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Volume API")
 
-# --- CORS (in Produktion auf deine Domain einschränken) -----------------------
+# --- CORS (in Produktion einschränken) ----------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -227,7 +227,7 @@ async def slice_check(
         "slicer_present": slicer_exists(),
     }
 
-# --- Echtes Slicen: Auto-Fix-Prozess + robuste Export-Matrix ------------------
+# --- Echtes Slicen: Auto-Fix-Prozess + Export-Matrix --------------------------
 @app.post("/slice", response_class=JSONResponse)
 async def slice_model(
     file: UploadFile = File(...),
