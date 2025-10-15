@@ -253,11 +253,11 @@ async def slice_model(
     out_3mf  = work / "output.3mf"
 
     # --- Auto-Fix-Prozessprofil gegen "relative E"-Fehler ---
-    tmp_process = work / "process_fix.json"
+    tmp_process = work / "process_fix.json")
     tmp_process.write_text(json.dumps({
         "name": "auto_relative_e_fix",
         "use_relative_e_distances": False,   # absolute E erzwingen
-        "layer_gcode": "G92 E0\n"            # zusätzlich pro Layer reset (unschädlich bei absoluten E)
+        "layer_gcode": "G92 E0\n"            # zusätzlich pro Layer reset
     }, ensure_ascii=False))
 
     # optionale Profile auto-laden
@@ -274,9 +274,10 @@ async def slice_model(
         if filament_chain:  cmd += ["--load-filaments", ";".join(filament_chain)]
         return cmd
 
-    # --- Export-Matrix (ohne arrange/orient, ohne overrides) ---
+    # --- Export-Matrix ---
     if export_kind == "gcode":
-        cmd = base_cmd() + ["--export-gcode", str(out_g)]                   # slict implizit
+        # FIX: einige Orca-Builds kennen --export-gcode nicht -> --gcode -o <file>
+        cmd = base_cmd() + ["--gcode", "-o", str(out_g)]
     elif export_kind == "3mf_project":
         cmd = base_cmd() + ["--export-3mf", str(out_3mf)]                   # ungesliced Projekt
     elif export_kind == "3mf_sliced":
@@ -288,7 +289,7 @@ async def slice_model(
 
     code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
     if code != 0:
-        raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+        raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
@@ -303,8 +304,8 @@ async def slice_model(
 
     if export_kind == "gcode" and out_g.exists():
         head = out_g.read_text(errors="ignore")[:120000]
-        from_hdr = parse_meta_from_gcode(head)
-        for k, v in from_hdr.items():
+        m2 = parse_meta_from_gcode(head)
+        for k, v in m2.items():
             if v is not None:
                 meta[k] = v
 
@@ -318,5 +319,5 @@ async def slice_model(
         "export_kind": export_kind,
         "out_size_bytes": out_file.stat().st_size,
         "meta": meta,
-        "notes": "Auto-Fix-Prozess aktiv; STL ohne --slice, 3mf_sliced nutzt --slice 0.",
+        "notes": "Auto-Fix-Prozess aktiv; G-Code via --gcode -o; STL ohne --slice, 3mf_sliced nutzt --slice 0.",
     }
