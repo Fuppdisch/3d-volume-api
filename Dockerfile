@@ -1,6 +1,7 @@
 # ---------- Dockerfile ----------
 FROM python:3.11-slim
 
+# Feste OrcaSlicer-Version (bei Bedarf per --build-arg überschreiben)
 ARG ORCA_URL="https://github.com/SoftFever/OrcaSlicer/releases/download/v2.3.1/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.3.1.AppImage"
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -11,23 +12,27 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PRUSASLICER_BIN="/usr/local/bin/orca-slicer" \
     QT_QPA_PLATFORM="offscreen"
 
-# Systemlibs & X-Stack (xvfb + xauth) + EGL/GBM/DRM + GStreamer
+# --- Systemlibs, X-Stack, EGL/GLES, GStreamer, typische Qt-X11-Abhängigkeiten ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl xz-utils squashfs-tools tini \
-      # OpenGL / EGL / X11 / GTK (Qt)
+      # OpenGL / EGL / GLES / DRM
       libgl1 libopengl0 libglu1-mesa \
       libegl1 libgles2 libgbm1 libdrm2 \
+      # X11 / Qt
       libx11-6 libx11-xcb1 libxcb1 libxcb-shm0 libxcb-render0 \
       libxrender1 libxrandr2 libxi6 libxfixes3 libxext6 libxkbcommon0 \
-      libdbus-1-3 \
+      libxcomposite1 libxcursor1 libxdamage1 libxinerama1 \
+      libdbus-1-3 libfontconfig1 \
       libgtk-3-0 libglib2.0-0 libgdk-pixbuf-2.0-0 \
       libpangocairo-1.0-0 libpango-1.0-0 libcairo2 \
+      # Headless Display
       xvfb xauth \
-      # GStreamer runtime (für Qt/Orca)
+      # GStreamer Runtime (Basis)
       libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+      gstreamer1.0-plugins-base gstreamer1.0-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# OrcaSlicer AppImage entpacken & verlinken
+# --- OrcaSlicer AppImage entpacken & verlinken --------------------------------
 RUN set -eux; \
     tmp="/tmp/orca.AppImage"; \
     echo "Lade OrcaSlicer: $ORCA_URL"; \
@@ -38,10 +43,11 @@ RUN set -eux; \
     ln -s /opt/orca/AppRun /usr/local/bin/orca-slicer; \
     echo 'export LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}"' > /etc/profile.d/orca.sh
 
+# Laufzeit-ENV
 ENV LD_LIBRARY_PATH="/opt/orca/usr/lib:/opt/orca/lib:${LD_LIBRARY_PATH}" \
     PATH="/opt/orca/usr/bin:/opt/orca/bin:${PATH}"
 
-# Python App
+# --- Python App ---------------------------------------------------------------
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
