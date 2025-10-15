@@ -288,7 +288,7 @@ async def slice_model(
 
     code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
     if code != 0:
-        raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+        raise HTTPException(status_code=500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
 
     # Metadaten einsammeln
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
