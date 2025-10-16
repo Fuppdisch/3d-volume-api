@@ -413,6 +413,7 @@ async def estimate_time(
     filament_profile: str = Form(None),
     material: str = Form("PLA"),  # PLA|PETG|ASA|PC
     infill: float = Form(0.35),   # 0..1 (z. B. 0.35 = 35%)
+    debug: int = Form(0),         # <-- NEU: Debug-Ausgabe aktivieren
 ):
     if not slicer_exists():
         raise HTTPException(500, "OrcaSlicer CLI nicht verfügbar.")
@@ -466,9 +467,11 @@ async def estimate_time(
             inp.as_posix(),
         ]
         cmd_min = base_min + ["--slice", "0", "--export-3mf", str(out_3mf)]
+        full_min = [XVFB, "-a"] + cmd_min
 
-        code, out, err = run([XVFB, "-a"] + cmd_min, timeout=900)
-        tail = (err or out)[-800:]
+        code, out, err = run(full_min, timeout=900)
+        tail = (err or out)[-1200:]
+        last_cmd = " ".join(full_min)
 
         # --- Fallback bei „No such file: 1“ ---
         if code != 0 and "No such file: 1" in tail:
@@ -480,18 +483,46 @@ async def estimate_time(
                 inp.as_posix(),
             ]
             cmd_ultra = base_ultra + ["--slice", "0", "--export-3mf", str(out_3mf), "--export-slicedata", str(out_meta)]
-            code2, out2, err2 = run([XVFB, "-a"] + cmd_ultra, timeout=900)
-            tail2 = (err2 or out2)[-800:]
+            full_ultra = [XVFB, "-a"] + cmd_ultra
+            code2, out2, err2 = run(full_ultra, timeout=900)
+            tail2 = (err2 or out2)[-1200:]
             code, out, err, tail = code2, out2, err2, tail2
+            last_cmd = " ".join(full_ultra)
 
         if code != 0:
-            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {tail}")
+            if debug:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": f"Slicing fehlgeschlagen (exit {code})",
+                        "cmd": last_cmd,
+                        "stderr_tail": tail[-2000:],
+                        "stdout_tail": (out or "")[-1000:],
+                        "profiles_used": {
+                            "printer": Path(pick_printer).name,
+                            "process": Path(pick_process0).name,
+                            "filament": Path(pick_filament).name
+                        }
+                    }
+                )
+            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {tail[-800:]}")
 
         meta = parse_slicedata_folder(out_meta)
         if not meta.get("duration_s"):
-            raise HTTPException(500, detail=f"Keine Druckzeit in Slicedata gefunden. Logs: {tail}")
+            if debug:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "detail": "Keine Druckzeit in Slicedata gefunden.",
+                        "cmd": last_cmd,
+                        "stderr_tail": tail[-2000:],
+                        "stdout_tail": (out or "")[-1000:],
+                        "slicedata_files": meta.get("files"),
+                    }
+                )
+            raise HTTPException(500, detail=f"Keine Druckzeit in Slicedata gefunden. Logs: {tail[-800:]}")
 
-        return {
+        resp = {
             "ok": True,
             "input_ext": ".3mf" if is_3mf else ".stl",
             "profiles_used": {
@@ -506,6 +537,11 @@ async def estimate_time(
             "filament_g": meta.get("filament_g"),
             "notes": "Gesliced mit festen Profilen (--slice 0). Minimal-Args; Fallback aktiv falls nötig."
         }
+        if debug:
+            resp["cmd"] = last_cmd
+            resp["slicedata_files"] = meta.get("files")
+        return resp
+
     finally:
         try: shutil.rmtree(work, ignore_errors=True)
         except Exception: pass
