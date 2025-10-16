@@ -114,6 +114,18 @@ def percent_from_frac(x: float) -> int:
     f = max(0.0, min(1.0, f))
     return int(round(f * 100))
 
+def normalize_opt_name(val: Optional[str]) -> Optional[str]:
+    """
+    Interpretiert leere/Platzhalter-Werte (z.B. 'string', 'null') als None.
+    Dadurch greifen Auto-Auswahlen für Profile.
+    """
+    if val is None:
+        return None
+    v = str(val).strip().strip('"').strip("'").lower()
+    if v in ("", "string", "none", "null", "undefined"):
+        return None
+    return str(val).strip()
+
 # --- Typ-Helper: schreibe Werte im gleichen Typ, wie er im Profil existiert ---
 def to_same_type(old_val, new_val):
     if isinstance(old_val, str):
@@ -584,6 +596,11 @@ async def estimate_time(
         raise HTTPException(400, "Leere Datei.")
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"Datei > {MAX_FILE_BYTES // (1024*1024)} MB.")
+
+    # <<< NEU: Swagger/Platzhalter robust ignorieren >>>
+    printer_profile  = normalize_opt_name(printer_profile)
+    process_profile  = normalize_opt_name(process_profile)
+    filament_profile = normalize_opt_name(filament_profile)
 
     prof = find_profiles()
     pick_printer  = must_pick(prof["printer"],  "printer",  printer_profile)
