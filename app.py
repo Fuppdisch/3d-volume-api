@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Volume API")
 
-# --- CORS (in Produktion einschränken) ----------------------------------------
+# --- CORS (für Produktion bitte einschränken) ---------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -121,12 +121,12 @@ def index():
     <input type="file" name="file" accept=".stl,.3mf" required>
     <label>export_kind</label>
     <select name="export_kind">
-      <option value="gcode">G-Code (.gcode)</option>
+      <option value="gcode">G-Code (.gcode)*</option>
       <option value="3mf_project">3MF-Projekt (ungesliced)</option>
       <option value="3mf_sliced">3MF (gesliced, nur bei 3MF Input)</option>
     </select>
     <input type="submit" value="Slicen">
-    <div><small>STL: am besten G-Code wählen. 3MF_sliced setzt --slice 0.</small></div>
+    <div><small>* Hinweis: Diese Orca-CLI exportiert G-Code nicht direkt; bei „G-Code“ wird intern 3MF gesliced erzeugt.</small></div>
   </form>
 </div>
 
@@ -249,7 +249,7 @@ async def slice_model(
 
     datadir  = work / "cfg";       datadir.mkdir(parents=True, exist_ok=True)
     out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
-    out_g    = work / "output.gcode"
+    out_g    = work / "output.gcode"   # bleibt ungenutzt bei dieser CLI, aber wir lassen es für evtl. spätere Switche da
     out_3mf  = work / "output.3mf"
 
     # --- Auto-Fix-Prozessprofil gegen "relative E"-Fehler ---
@@ -274,32 +274,24 @@ async def slice_model(
         if filament_chain:  cmd += ["--load-filaments", ";".join(filament_chain)]
         return cmd
 
-    # --- Export-Matrix + Fallbacks für G-Code-Flag ---
-    if export_kind == "gcode":
-        primary = base_cmd() + ["--gcode", "-o", str(out_g)]
-        code, out, err = run(["xvfb-run","-a"] + primary, timeout=900)
-        if code != 0 and ("Invalid option --gcode" in (err or out) or "Unrecognized option '--gcode'" in (err or out)):
-            # Fallback: einige Builds nutzen -g statt --gcode
-            secondary = base_cmd() + ["-g", "-o", str(out_g)]
-            code, out, err = run(["xvfb-run","-a"] + secondary, timeout=900)
-        if code != 0:
-            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
-    elif export_kind == "3mf_project":
-        cmd = base_cmd() + ["--export-3mf", str(out_3mf)]
-        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
-        if code != 0:
-            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
-    elif export_kind == "3mf_sliced":
-        if not is_3mf:
-            raise HTTPException(400, "3mf_sliced erfordert eine .3mf Eingabedatei.")
+    # --- Export-Matrix (Bambu/Orca-Style: Export = 3MF) -----------------------
+    out_kind = export_kind
+    if export_kind == "3mf_project":
+        cmd = base_cmd() + ["--export-3mf", str(out_3mf)]                   # ungesliced Projekt
+    elif export_kind in ("3mf_sliced", "gcode"):
+        # geslictes 3MF (Platte 0 = alle); "gcode" wird auf 3mf_sliced umgebogen,
+        # weil diese Orca-CLI keinen G-Code-Export per Flag bereitstellt.
         cmd = base_cmd() + ["--slice", "0", "--export-3mf", str(out_3mf)]
-        code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
-        if code != 0:
-            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+        if export_kind == "gcode":
+            out_kind = "3mf_sliced"
     else:
         raise HTTPException(400, "export_kind muss 'gcode' | '3mf_project' | '3mf_sliced' sein.")
 
-    # Metadaten einsammeln
+    code, out, err = run(["xvfb-run","-a"] + cmd, timeout=900)
+    if code != 0:
+        raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {(err or out)[-1000:]}")
+
+    # Metadaten einsammeln (falls vorhanden)
     meta = {"duration_s": None, "filament_mm": None, "filament_g": None}
     for jf in out_meta.glob("*.json"):
         try:
@@ -310,22 +302,20 @@ async def slice_model(
         except Exception:
             pass
 
-    if export_kind == "gcode" and out_g.exists():
-        head = out_g.read_text(errors="ignore")[:120000]
-        from_hdr = parse_meta_from_gcode(head)
-        for k, v in from_hdr.items():
-            if v is not None:
-                meta[k] = v
-
-    out_file = {"gcode": out_g, "3mf_project": out_3mf, "3mf_sliced": out_3mf}[export_kind]
+    # Ausgabedatei prüfen (hier: immer 3MF)
+    out_file = out_3mf
     if not out_file.exists() or out_file.stat().st_size == 0:
         raise HTTPException(500, "Slicing erfolgreich, aber Ausgabedatei fehlt/leer.")
 
+    # (optional) Meta aus G-Code-Header gibt es hier naturgemäß nicht
     return {
         "ok": True,
         "input_ext": ".3mf" if is_3mf else ".stl",
-        "export_kind": export_kind,
+        "export_kind": out_kind,
         "out_size_bytes": out_file.stat().st_size,
         "meta": meta,
-        "notes": "Auto-Fix-Prozess aktiv; G-Code via --gcode -o (Fallback -g -o); STL ohne --slice; 3mf_sliced nutzt --slice 0.",
+        "notes": (
+            "Diese Orca-CLI unterstützt keinen direkten G-Code-Export; "
+            "bei export_kind=gcode wurde auf 3mf_sliced (--slice 0 --export-3mf) umgestellt."
+        ),
     }
