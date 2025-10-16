@@ -166,7 +166,7 @@ def harden_process_profile(
     - Relative E ("1"), G92 E0 in layer_gcode; G92 E0 aus before_layer_gcode entfernen.
     - Negative Felder auf 0.
     - fill_density als **String** in %.
-    - Maschinen-Bindungen entfernen / Nozzle an Drucker angleichen.
+    - Maschinen-/Preset-Bindungen konsequent entfernen; Nozzle an Drucker angleichen.
     """
     try:
         proc = load_json(Path(src_path))
@@ -264,21 +264,29 @@ def harden_process_profile(
         else:
             target["fill_density"] = val_str
 
-    # Maschinen-Bindungen entfernen + Nozzle angleichen
+    # Maschinen-/Preset-Bindungen konsequent entfernen
     kill_keys = [
         "compatible_printers", "compatible_printers_condition",
         "machine_name", "machine_series", "machine_type", "machine_technology",
         "machine_profile", "machine_kit", "hotend_type",
         "printer_model", "printer_brand", "printer_series",
         "inherits_from",
+        # erweitert:
+        "definition", "definition_id", "definition_type",
+        "device_profile_id", "family", "vendor", "manufacturer",
+        "model_id", "series_id", "printer_variant",
+        "preset_name", "preset_id", "preset_bundle",
     ]
     for k in kill_keys:
-        if k in target:
-            del target[k]
-        if k in proc:
-            del proc[k]
+        if k in target: del target[k]
+        if k in proc:   del proc[k]
 
-    # Nozzle setzen als String
+    # Zusätzliche Neutralisierungen
+    for k in ("printer_model", "machine_series", "series"):
+        if k in target: target[k] = ""
+        if k in proc:   proc[k] = ""
+
+    # Nozzle setzen (als String)
     if "nozzle_diameter" in target:
         target["nozzle_diameter"] = str(nozzle_from_printer)
     elif "nozzle_diameter" in proc:
@@ -287,8 +295,7 @@ def harden_process_profile(
         target["nozzle_diameter"] = str(nozzle_from_printer)
 
     # type/name setzen
-    if "type" not in proc or (isinstance(proc.get("type"), str) and proc.get("type", "").strip() == ""):
-        proc["type"] = "process"
+    proc["type"] = "process"
     if "name" not in proc or (isinstance(proc.get("name"), str) and proc.get("name", "").strip() == ""):
         proc["name"] = Path(src_path).stem + " (hardened)"
 
@@ -300,7 +307,7 @@ def harden_filament_profile(src_path: str, workdir: Path) -> str:
     """
     Filament-Profil so normalisieren, dass Orca es sicher als 'filament' erkennt.
     - type='filament' + name setzen/sichern
-    - Kompatibilitäts-/Maschinen-Bindungen entfernen
+    - Kompatibilitäts-/Maschinen-/Preset-Bindungen entfernen
     - Problematische numerische Felder defensiv normalisieren
     """
     try:
@@ -315,18 +322,22 @@ def harden_filament_profile(src_path: str, workdir: Path) -> str:
     target = settings if isinstance(settings, dict) else fil
 
     # type/name sicherstellen
-    if "type" not in fil or (isinstance(fil.get("type"), str) and fil.get("type", "").strip() == ""):
-        fil["type"] = "filament"
+    fil["type"] = "filament"
     if "name" not in fil or (isinstance(fil.get("name"), str) and fil.get("name", "").strip() == ""):
         fil["name"] = Path(src_path).stem
 
-    # Maschinen-/Kompatibilitäts-Bindungen entfernen
+    # Maschinen-/Preset-Bindungen entfernen
     kill_keys = [
         "compatible_printers", "compatible_printers_condition",
         "machine_name", "machine_series", "machine_type", "machine_technology",
         "machine_profile", "machine_kit", "hotend_type",
         "printer_model", "printer_brand", "printer_series",
         "inherits_from",
+        # erweitert:
+        "definition", "definition_id", "definition_type",
+        "device_profile_id", "family", "vendor", "manufacturer",
+        "model_id", "series_id", "printer_variant",
+        "preset_name", "preset_id", "preset_bundle",
     ]
     for k in kill_keys:
         if k in target: del target[k]
