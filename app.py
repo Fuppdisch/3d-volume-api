@@ -54,9 +54,7 @@ XVFB = shutil.which("xvfb-run") or "xvfb-run"
 #                                     Utils                                    #
 # -----------------------------------------------------------------------------#
 def sha256_of_bytes(buf: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(buf)
-    return h.hexdigest()
+    h = hashlib.sha256(); h.update(buf); return h.hexdigest()
 
 def slicer_exists() -> bool:
     return (os.path.isfile(SLICER_BIN) and os.access(SLICER_BIN, os.X_OK)) or \
@@ -73,7 +71,7 @@ def find_profiles() -> Dict[str, List[str]]:
     """Finde Profil-Dateien im Container (/app/profiles)."""
     base = Path("/app/profiles")
     res = {"printer": [], "process": [], "filament": []}
-    for key, sub in [("printer", "printers"), ("process", "process"), ("filament", "filaments")]:
+    for key, sub in [("printer","printers"), ("process","process"), ("filament","filaments")]:
         d = base / sub
         if d.exists():
             res[key] = sorted(str(p) for p in d.glob("*.json"))
@@ -361,6 +359,28 @@ def harden_filament_profile(src_path: str, workdir: Path) -> str:
     return str(out)
 
 # -----------------------------------------------------------------------------#
+#                     Synthetisches, ultrainertes Process-Preset               #
+# -----------------------------------------------------------------------------#
+def make_synthetic_process(workdir: Path, *, fill_density_pct: int, nozzle: float) -> str:
+    """
+    Minimales, generisches Process-Profil, das mit (nahezu) jeder Maschine kompatibel ist.
+    Nur das Nötigste: relative E, G92 E0 pro Layer, Infill %, Nozzle-Durchmesser.
+    Alle Werte als Strings (Orca akzeptiert das).
+    """
+    proc = {
+        "type": "process",
+        "name": "synthetic_auto",
+        "use_relative_e_distances": "1",
+        "layer_gcode": "G92 E0",
+        "fill_density": str(int(max(0, min(100, fill_density_pct)))),
+        "nozzle_diameter": str(float(nozzle) if nozzle else 0.4),
+        # bewusst KEINE Maschine-/Preset-Felder
+    }
+    out = workdir / "process_synthetic.json"
+    save_json(out, proc)
+    return str(out)
+
+# -----------------------------------------------------------------------------#
 #                         3MF-Sanitisierung                                    #
 # -----------------------------------------------------------------------------#
 def sanitize_3mf_remove_configs(src_bytes: bytes) -> bytes:
@@ -457,15 +477,12 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
         objects = root.findall(".//m:object", ns) if ns else root.findall(".//object")
         res["objects_count"] = len(objects)
 
-        tri_total = 0
-        out_objects = []
+        tri_total = 0; out_objects = []
         for obj in objects:
-            oid = obj.attrib.get("id")
-            typ = obj.attrib.get("type")
+            oid = obj.attrib.get("id"); typ = obj.attrib.get("type")
             mesh_elem = obj.find("m:mesh", ns) if ns else obj.find("mesh")
             if mesh_elem is None:
-                out_objects.append({"id": oid, "type": typ, "triangles": 0})
-                continue
+                out_objects.append({"id": oid, "type": typ, "triangles": 0}); continue
 
             tris = mesh_elem.find("m:triangles", ns) if ns else mesh_elem.find("triangles")
             tri_count = len(tris.findall("m:triangle", ns) if ns else tris.findall("triangle")) if tris is not None else 0
@@ -478,25 +495,16 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
                 coords = []
                 for v in vs:
                     try:
-                        x = float(v.attrib.get("x", "0"))
-                        y = float(v.attrib.get("y", "0"))
-                        z = float(v.attrib.get("z", "0"))
+                        x = float(v.attrib.get("x", "0")); y = float(v.attrib.get("y", "0")); z = float(v.attrib.get("z", "0"))
                         coords.append((x, y, z))
                     except Exception:
                         pass
                 if coords:
                     arr = np.array(coords, dtype=float)
-                    vmin = arr.min(axis=0)
-                    vmax = arr.max(axis=0)
-                    bbox = {
-                        "bbox_min": np_to_list(vmin),
-                        "bbox_max": np_to_list(vmax),
-                        "bbox_size": np_to_list(vmax - vmin),
-                    }
+                    vmin = arr.min(axis=0); vmax = arr.max(axis=0)
+                    bbox = {"bbox_min": np_to_list(vmin), "bbox_max": np_to_list(vmax), "bbox_size": np_to_list(vmax - vmin)}
 
-            out_objects.append(
-                {"id": oid, "type": typ, "triangles": tri_count, **({"bbox": bbox} if bbox else {})}
-            )
+            out_objects.append({"id": oid, "type": typ, "triangles": tri_count, **({"bbox": bbox} if bbox else {})})
 
         res["triangles_total"] = tri_total
         res["objects"] = out_objects
@@ -669,6 +677,41 @@ async def analyze_upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"Analyse fehlgeschlagen: {e}")
 
+# ----------------------------- Profile-Debug ----------------------------------
+@app.get("/debug_profiles", response_class=JSONResponse)
+def debug_profiles(
+    printer_profile: str = None,
+    process_profile: str = None,
+    filament_profile: str = None,
+):
+    prof = find_profiles()
+    pick_printer  = must_pick(prof["printer"],  "printer",  normalize_opt_name(printer_profile))
+    pick_process0 = must_pick(prof["process"],  "process",  normalize_opt_name(process_profile))
+    if filament_profile:
+        pick_filament = must_pick(prof["filament"], "filament", normalize_opt_name(filament_profile))
+    else:
+        pick_filament = prof["filament"][0] if prof["filament"] else None
+
+    work = Path(tempfile.mkdtemp(prefix="dbg_"))
+    try:
+        prn_h = harden_printer_profile(pick_printer, work)
+        prn_json = load_json(Path(pick_printer))
+        proc_h = harden_process_profile(pick_process0, work, fill_density_pct=35, printer_json=prn_json)
+        fil_h = harden_filament_profile(pick_filament, work) if pick_filament else None
+
+        res = {
+            "printer_src": pick_printer,
+            "process_src": pick_process0,
+            "filament_src": pick_filament,
+            "printer_hardened": json.loads(Path(prn_h).read_text()),
+            "process_hardened": json.loads(Path(proc_h).read_text()),
+        }
+        if fil_h:
+            res["filament_hardened"] = json.loads(Path(fil_h).read_text())
+        return res
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
 # ----------------------------- Slicing/Timing --------------------------------
 @app.post("/estimate_time", response_class=JSONResponse)
 async def estimate_time(
@@ -738,95 +781,97 @@ async def estimate_time(
         )
         hardened_filament = harden_filament_profile(pick_filament, work)
 
-        # Reihenfolge: PRINTER → PROCESS
-        settings_chain = [hardened_printer, hardened_process]
-        filament_chain = [hardened_filament]
+        # Fallback-Strategien
+        attempts = []
 
-        base_min = [
-            SLICER_BIN,
-            "--datadir", str(datadir),
-            "--load-settings", ";".join(settings_chain),
+        # A) Printer + Process (Standard)
+        settings_chain_A = [hardened_printer, hardened_process]
+        filament_chain = [hardened_filament]
+        cmd_A = [
+            SLICER_BIN, "--datadir", str(datadir),
+            "--load-settings", ";".join(settings_chain_A),
             "--load-filaments", ";".join(filament_chain),
             "--export-slicedata", str(out_meta),
             inp.as_posix(),
+            "--slice", "0", "--export-3mf", str(out_3mf)
         ]
-        cmd_min = base_min + ["--slice", "0", "--export-3mf", str(out_3mf)]
-        full_min = [XVFB, "-a"] + cmd_min
+        attempts.append(("A_printer+process", [XVFB, "-a"] + cmd_A))
 
-        code, out, err = run(full_min, timeout=900)
-        tail = (err or out)[-2000:]
-        last_cmd = " ".join(full_min)
+        # B) Printer + synthetisches Process
+        synth_proc = make_synthetic_process(
+            work, fill_density_pct=infill_pct,
+            nozzle=float(hardened_printer_json.get("nozzle_diameter", 0.4)) if isinstance(hardened_printer_json, dict) else 0.4
+        )
+        settings_chain_B = [hardened_printer, synth_proc]
+        cmd_B = [
+            SLICER_BIN, "--datadir", str(datadir),
+            "--load-settings", ";".join(settings_chain_B),
+            "--load-filaments", ";".join(filament_chain),
+            "--export-slicedata", str(out_meta),
+            inp.as_posix(),
+            "--slice", "0", "--export-3mf", str(out_3mf)
+        ]
+        attempts.append(("B_printer+synthetic", [XVFB, "-a"] + cmd_B))
 
-        if code != 0 and "No such file: 1" in tail:
-            base_ultra = [
-                SLICER_BIN,
-                "--datadir", str(datadir),
-                "--load-settings", ";".join(settings_chain),
-                "--load-filaments", ";".join(filament_chain),
-                inp.as_posix(),
-            ]
-            cmd_ultra = base_ultra + ["--slice", "0", "--export-3mf", str(out_3mf), "--export-slicedata", str(out_meta)]
-            full_ultra = [XVFB, "-a"] + cmd_ultra
-            code2, out2, err2 = run(full_ultra, timeout=900)
-            tail2 = (err2 or out2)[-2000:]
-            code, out, err, tail = code2, out2, err2, tail2
-            last_cmd = " ".join(full_ultra)
+        # C) Nur synthetisches Process (ohne Printer)
+        settings_chain_C = [synth_proc]
+        cmd_C = [
+            SLICER_BIN, "--datadir", str(datadir),
+            "--load-settings", ";".join(settings_chain_C),
+            "--load-filaments", ";".join(filament_chain),
+            "--export-slicedata", str(out_meta),
+            inp.as_posix(),
+            "--slice", "0", "--export-3mf", str(out_3mf)
+        ]
+        attempts.append(("C_synthetic_only", [XVFB, "-a"] + cmd_C))
 
-        if code != 0:
-            if debug:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "detail": f"Slicing fehlgeschlagen (exit {code})",
-                        "cmd": last_cmd,
-                        "stderr_tail": tail[-2000:],
-                        "stdout_tail": (out or "")[-1000:],
-                        "profiles_used": {
-                            "printer": Path(pick_printer).name,
-                            "process": Path(pick_process0).name,
-                            "filament": Path(pick_filament).name
-                        }
-                    }
-                )
-            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {tail[-800:]}")
+        last = {}
+        for tag, full_cmd in attempts:
+            code, out, err = run(full_cmd, timeout=900)
+            tail = (err or out)[-2000:]
+            last = {"tag": tag, "cmd": " ".join(full_cmd), "code": code, "stderr_tail": tail, "stdout_tail": (out or "")[-1000:]}
+            if code == 0:
+                meta = parse_slicedata_folder(out_meta)
+                if not meta.get("duration_s"):
+                    # kein Zeitwert trotz Erfolg → weiter probieren
+                    continue
 
-        meta = parse_slicedata_folder(out_meta)
-        if not meta.get("duration_s"):
-            if debug:
-                return JSONResponse(
-                    status_code=500,
-                    content={
-                        "detail": "Keine Druckzeit in Slicedata gefunden.",
-                        "cmd": last_cmd,
-                        "stderr_tail": tail[-2000:],
-                        "stdout_tail": (out or "")[-1000:],
-                        "slicedata_files": meta.get("files"),
-                    }
-                )
-            raise HTTPException(500, detail=f"Keine Druckzeit in Slicedata gefunden. Logs: {tail[-800:]}")
+                resp = {
+                    "ok": True,
+                    "strategy": tag,
+                    "input_ext": ".3mf" if is_3mf else ".stl",
+                    "profiles_used": {
+                        "printer": Path(pick_printer).name,
+                        "process": Path(pick_process0).name,
+                        "filament": Path(pick_filament).name
+                    },
+                    "material": material.upper(),
+                    "infill_pct": infill_pct,
+                    "duration_s": float(meta["duration_s"]),
+                    "filament_mm": meta.get("filament_mm"),
+                    "filament_g": meta.get("filament_g"),
+                    "notes": "Fixed profiles slicing mit Fallback (A→B→C). 3MF-Configs entfernt; relative E + G92 E0 erzwungen."
+                }
+                if debug:
+                    resp["cmd"] = last["cmd"]
+                    resp["slicedata_files"] = meta.get("files")
+                return resp
 
-        resp = {
-            "ok": True,
-            "input_ext": ".3mf" if is_3mf else ".stl",
-            "profiles_used": {
-                "printer": Path(pick_printer).name,
-                "process": Path(pick_process0).name,
-                "filament": Path(pick_filament).name
-            },
-            "material": material.upper(),
-            "infill_pct": infill_pct,
-            "duration_s": float(meta["duration_s"]),
-            "filament_mm": meta.get("filament_mm"),
-            "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0). 3MF-Configs entfernt. Reihenfolge: Printer→Process. Fallback aktiv."
-        }
+        # Alle Versuche fehlgeschlagen
         if debug:
-            resp["cmd"] = last_cmd
-            resp["slicedata_files"] = meta.get("files")
-        return resp
-
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "detail": f"Slicing fehlgeschlagen nach 3 Versuchen; letzter Code {last.get('code')}",
+                    "last_attempt": last,
+                    "profiles_used": {
+                        "printer": Path(pick_printer).name,
+                        "process": Path(pick_process0).name,
+                        "filament": Path(pick_filament).name
+                    }
+                }
+            )
+        raise HTTPException(500, f"Slicing fehlgeschlagen (alle Strategien). Letzte Meldung: {last.get('stderr_tail','')[-800:]}")
     finally:
-        try:
-            shutil.rmtree(work, ignore_errors=True)
-        except Exception:
-            pass
+        try: shutil.rmtree(work, ignore_errors=True)
+        except Exception: pass
