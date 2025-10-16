@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import xml.etree.ElementTree as ET
 import trimesh
 import numpy as np
+import re
 
 app = FastAPI(title="3D Print – Fixed Profiles Slicing API")
 
@@ -119,7 +120,6 @@ def to_same_type(old_val, new_val):
     Konvertiere new_val in den Typ von old_val (so gut es geht),
     weil Orca-Profile häufig Strings für Zahlen/Booleans verwenden.
     """
-    # Strings im Profil: schreibe als String
     if isinstance(old_val, str):
         if isinstance(new_val, bool):
             return "1" if new_val else "0"
@@ -169,29 +169,42 @@ def set_typed(obj: dict, key: str, desired, default_type="string"):
         else:
             obj[key] = str(desired)
 
+# -----------------------------------------------------------------------------#
+#                         Process-Profil härten (NEU)                          #
+# -----------------------------------------------------------------------------#
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
     Process-Profil minimal härten + optional Infill-Dichte (in %) überschreiben.
-    WICHTIG: Typen der Ziel-Keys so schreiben, wie sie im Profil vorhanden sind.
+    - RELATIVE E aktivieren (use_relative_e_distances = true)
+    - 'G92 E0' in layer_gcode sicherstellen (pro Layer)
+    - 'G92 E0' in before_layer_gcode entfernen
+    - Negative Werte reparieren (0)
+    - fill_density typgerecht setzen
     """
     try:
         proc = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
-    # 1) Auf absolute E umstellen (use_relative_e_distances = false/0/"0")
+    # Relative E (verhindert Absolut/Before-Layer-Konflikt)
     if "use_relative_e_distances" in proc:
-        set_typed(proc, "use_relative_e_distances", False)
+        set_typed(proc, "use_relative_e_distances", True)
     else:
-        set_typed(proc, "use_relative_e_distances", False, default_type="bool")
+        set_typed(proc, "use_relative_e_distances", True, default_type="bool")
 
-    # 2) G92 E0 in layer_gcode sicherstellen (String-Feld)
+    # layer_gcode: G92 E0 sicherstellen
     lg = (proc.get("layer_gcode") or "").strip()
     if "G92 E0" not in lg:
         lg = (lg + "\nG92 E0\n").strip()
     proc["layer_gcode"] = lg
 
-    # 3) Negative Werte reparieren (typgerecht)
+    # before_layer_gcode: G92 E0 entfernen
+    blg = (proc.get("before_layer_gcode") or "")
+    if "G92 E0" in blg.upper():
+        lines = [ln for ln in blg.splitlines() if "G92 E0" not in ln.upper()]
+        proc["before_layer_gcode"] = "\n".join(lines).strip()
+
+    # Negative Felder korrigieren
     for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
         if k in proc:
             v = proc[k]
@@ -202,7 +215,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
             else:
                 set_typed(proc, k, 0 if fv < 0 else fv)
 
-    # 4) Infill (fill_density) auf Prozent setzen – Typ wie im Profil
+    # Infill
     if fill_density_pct is not None:
         if "fill_density" in proc:
             set_typed(proc, "fill_density", int(max(0, min(100, fill_density_pct))))
@@ -212,6 +225,49 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
     out = workdir / "process_hardened.json"
     save_json(out, proc)
     return str(out)
+
+# -----------------------------------------------------------------------------#
+#                         3MF-Sanitisierung (NEU)                              #
+# -----------------------------------------------------------------------------#
+def sanitize_3mf_remove_configs(src_bytes: bytes) -> bytes:
+    """
+    Entfernt Config-/Metadata-Anteile aus einer 3MF-ZIP, damit NUR unsere festen Profile greifen.
+    - Entfernt Ordner/Dateien namens 'config/*' und 'metadata/*'
+    - Entfernt JSON/INI, die 'config'/'setting'/'profile' im Pfad tragen
+    - Bereinigt 3D/3dmodel.model von <metadata>-Blöcken
+    """
+    src = io.BytesIO(src_bytes)
+    with zipfile.ZipFile(src, "r") as zin:
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                name = info.filename
+                lower = name.lower()
+
+                # Ordner pauschal ausschließen
+                if lower.startswith("config/") or "/config/" in lower:
+                    continue
+                if lower.startswith("metadata/") or "/metadata/" in lower:
+                    continue
+
+                # Einzeldateien mit offensichtlichen Configs
+                if (lower.endswith(".json") or lower.endswith(".ini")) and \
+                   any(tok in lower for tok in ("config", "setting", "profile")):
+                    continue
+
+                data = zin.read(name)
+
+                # Model-XML: alle <metadata> löschen (robust per Regex)
+                if lower in ("3d/3dmodel.model", "3d/model.model", "3d/model"):
+                    try:
+                        s = data.decode("utf-8", errors="ignore")
+                        s = re.sub(r"<\s*metadata\b[^>]*>.*?<\s*/\s*metadata\s*>", "", s, flags=re.I | re.S)
+                        data = s.encode("utf-8")
+                    except Exception:
+                        pass
+
+                zout.writestr(name, data)
+        return out_buf.getvalue()
 
 # -----------------------------------------------------------------------------#
 #                               Analyse (STL/3MF)                              #
@@ -521,7 +577,14 @@ async def estimate_time(
     try:
         is_3mf = filename.endswith(".3mf")
         inp = work / ("input.3mf" if is_3mf else "input.stl")
-        inp.write_bytes(data)
+
+        # 3MF vor dem Schreiben sanieren
+        if is_3mf:
+            data_sane = sanitize_3mf_remove_configs(data)
+            inp.write_bytes(data_sane)
+        else:
+            inp.write_bytes(data)
+
         out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
@@ -545,7 +608,7 @@ async def estimate_time(
         full_min = [XVFB, "-a"] + cmd_min
 
         code, out, err = run(full_min, timeout=900)
-        tail = (err or out)[-1200:]
+        tail = (err or out)[-2000:]
         last_cmd = " ".join(full_min)
 
         # --- Fallback bei „No such file: 1“ ---
@@ -560,7 +623,7 @@ async def estimate_time(
             cmd_ultra = base_ultra + ["--slice", "0", "--export-3mf", str(out_3mf), "--export-slicedata", str(out_meta)]
             full_ultra = [XVFB, "-a"] + cmd_ultra
             code2, out2, err2 = run(full_ultra, timeout=900)
-            tail2 = (err2 or out2)[-1200:]
+            tail2 = (err2 or out2)[-2000:]
             code, out, err, tail = code2, out2, err2, tail2
             last_cmd = " ".join(full_ultra)
 
@@ -610,7 +673,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0). Minimal-Args; Fallback aktiv falls nötig."
+            "notes": "Gesliced mit festen Profilen (--slice 0). 3MF-Configs entfernt. Fallback aktiv falls nötig."
         }
         if debug:
             resp["cmd"] = last_cmd
