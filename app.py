@@ -12,7 +12,7 @@ import subprocess
 import logging
 import traceback
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -123,6 +123,50 @@ def normalize_opt_name(val: Optional[str]) -> Optional[str]:
         return None
     return str(val).strip()
 
+# ---- robust number extraction (handles list / strings / numbers) ----
+def first_number(v: Union[str, float, int, List, tuple]) -> Optional[float]:
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, (list, tuple)) and v:
+            # Nimmt erstes numerisches Element
+            for item in v:
+                n = first_number(item)
+                if n is not None:
+                    return n
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            # einfache Liste im String z.B. "[0.2, 0.4]"
+            m = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", s)
+            if m:
+                return float(m[0])
+        return None
+    except Exception:
+        return None
+
+def extract_nozzle_from_printer(prn: dict, fallback: float = 0.4) -> float:
+    if not isinstance(prn, dict):
+        return fallback
+    candidates = [
+        prn.get("nozzle_diameter"),
+        prn.get("nozzle"),
+        prn.get("hotend_nozzle_diameter"),
+    ]
+    s = prn.get("settings")
+    if isinstance(s, dict):
+        candidates += [
+            s.get("nozzle_diameter"),
+            s.get("nozzle"),
+            s.get("hotend_nozzle_diameter"),
+            s.get("nozzles"),
+        ]
+    for c in candidates:
+        n = first_number(c)
+        if n is not None and n > 0:
+            return float(n)
+    return float(fallback)
+
 # =================== Profile hardening / neutralisieren ======================
 
 def harden_printer_profile(src_path: str, workdir: Path) -> str:
@@ -157,25 +201,8 @@ def harden_process_profile(
     settings = proc.get("settings")
     target = settings if isinstance(settings, dict) else proc
 
-    # Nozzle aus Printer (falls vorhanden)
-    prn = printer_json or {}
-    nozzle_from_printer = None
-    if isinstance(prn, dict):
-        candidates = [
-            prn.get("nozzle_diameter"), prn.get("nozzle"), prn.get("hotend_nozzle_diameter"),
-        ]
-        if isinstance(prn.get("settings"), dict):
-            s = prn["settings"]
-            candidates += [s.get("nozzle_diameter"), s.get("nozzle"), s.get("hotend_nozzle_diameter")]
-        for v in candidates:
-            try:
-                if v is None: continue
-                nozzle_from_printer = float(v) if not isinstance(v, str) else float(str(v).replace(",", "."))
-                break
-            except Exception:
-                pass
-    if nozzle_from_printer is None:
-        nozzle_from_printer = 0.4
+    # Nozzle robust aus Printer lesen
+    nozzle_from_printer = extract_nozzle_from_printer(printer_json or {}, 0.4)
 
     # relative E erzwingen
     key_rel = "use_relative_e_distances"
@@ -211,19 +238,23 @@ def harden_process_profile(
         if k in target:
             v = target[k]
             try:
-                fv = float(v) if not isinstance(v, str) else float(v.replace(",", "."))
+                fv = first_number(v)
             except Exception:
+                fv = None
+            if fv is None or fv < 0:
                 target[k] = "0"
             else:
-                target[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
+                target[k] = str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
         elif k in proc:
             v = proc[k]
             try:
-                fv = float(v) if not isinstance(v, str) else float(v.replace(",", "."))
+                fv = first_number(v)
             except Exception:
+                fv = None
+            if fv is None or fv < 0:
                 proc[k] = "0"
             else:
-                proc[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
+                proc[k] = str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
 
     # Infill in % (als String)
     if fill_density_pct is not None:
@@ -297,15 +328,11 @@ def harden_filament_profile(src_path: str, workdir: Path) -> str:
 
     for k in ("filament_density", "filament_diameter", "max_fan_speed", "min_fan_speed"):
         if k in target:
-            try:
-                v = target[k]
-                fv = float(v) if not isinstance(v, str) else float(str(v).replace(",", "."))
-                if not np.isfinite(fv) or fv < 0:
-                    target[k] = "0"
-                else:
-                    target[k] = str(fv)
-            except Exception:
+            fv = first_number(target[k])
+            if fv is None or not np.isfinite(fv) or fv < 0:
                 target[k] = "0"
+            else:
+                target[k] = str(float(fv))
 
     out = workdir / "filament_hardened.json"
     save_json(out, fil)
@@ -718,6 +745,8 @@ async def estimate_time(
         )
         hardened_filament = harden_filament_profile(pick_filament, work)
 
+        nozzle_for_synth = extract_nozzle_from_printer(hardened_printer_json, 0.4)
+
         attempts = []
 
         # A) Printer + Process
@@ -736,7 +765,7 @@ async def estimate_time(
         # B) Printer + synthetisches Process
         synth_proc = make_synthetic_process(
             work, fill_density_pct=infill_pct,
-            nozzle=float(hardened_printer_json.get("nozzle_diameter", 0.4)) if isinstance(hardened_printer_json, dict) else 0.4
+            nozzle=nozzle_for_synth
         )
         settings_chain_B = [hardened_printer, synth_proc]
         cmd_B = [
