@@ -461,14 +461,16 @@ async def estimate_time(
         settings_chain = [hardened_process, pick_printer]
         filament_chain = [pick_filament]
 
-        base = [SLICER_BIN,
-                "--datadir", str(datadir),
-                "--info",
-                "--allow-newer-file", "1",
-                "--load-settings", ";".join(settings_chain),
-                "--load-filaments", ";".join(filament_chain),
-                "--export-slicedata", str(out_meta),
-                inp.as_posix()]
+        base = [
+            SLICER_BIN,
+            "--datadir", str(datadir),
+            "--info",
+            "--allow-newer-file",          # <— ohne "1"
+            "--load-settings", ";".join(settings_chain),
+            "--load-filaments", ";".join(filament_chain),
+            "--export-slicedata", str(out_meta),
+            inp.as_posix(),
+        ]
 
         # Platte 0 slicen und 3MF für Debug ablegen
         cmd = base + ["--slice", "0", "--export-3mf", str(out_3mf)]
