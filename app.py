@@ -170,64 +170,119 @@ def set_typed(obj: dict, key: str, desired, default_type="string"):
             obj[key] = str(desired)
 
 # -----------------------------------------------------------------------------#
-#                         Process-Profil härten (NEU)                          #
+#                         Process-Profil härten (FINAL)                        #
 # -----------------------------------------------------------------------------#
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
-    Process-Profil minimal härten + optional Infill-Dichte (in %) überschreiben.
-    - RELATIVE E aktivieren (use_relative_e_distances = true)
-    - 'G92 E0' in layer_gcode sicherstellen (pro Layer)
-    - 'G92 E0' in before_layer_gcode entfernen
-    - Negative Werte reparieren (0)
-    - fill_density typgerecht setzen
+    Process-Profil härten, ohne die Orca-Struktur zu zerstören:
+    - Bevorzugt im "settings"-Block arbeiten (falls vorhanden).
+    - type="process" + name setzen/sichern.
+    - Relative E aktivieren, G92 E0 in layer_gcode (pro Layer), G92 E0 aus before_layer_gcode entfernen.
+    - Negative Parameter auf 0 setzen (typgerecht).
+    - fill_density in % setzen (typgerecht).
     """
     try:
         proc = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
-    # Relative E (verhindert Absolut/Before-Layer-Konflikt)
-    if "use_relative_e_distances" in proc:
-        set_typed(proc, "use_relative_e_distances", True)
-    else:
-        set_typed(proc, "use_relative_e_distances", True, default_type="bool")
+    # Zielknoten: settings (falls vorhanden), sonst Top-Level
+    settings = proc.get("settings")
+    target = settings if isinstance(settings, dict) else proc
 
-    # layer_gcode: G92 E0 sicherstellen
-    lg = (proc.get("layer_gcode") or "").strip()
+    def set_param(key: str, value, default_type="string"):
+        if key in target:
+            target[key] = to_same_type(target[key], value)
+        else:
+            if key in proc and target is not proc:
+                target[key] = to_same_type(proc[key], value)
+            else:
+                if default_type == "bool":
+                    target[key] = "1" if bool(value) else "0"
+                elif default_type == "number":
+                    try:
+                        f = float(value)
+                        target[key] = int(round(f)) if f.is_integer() else f
+                    except Exception:
+                        target[key] = str(value)
+                else:
+                    target[key] = str(value)
+
+    # 1) Relative E aktivieren
+    key_rel = "use_relative_e_distances"
+    if key_rel in target:
+        target[key_rel] = to_same_type(target[key_rel], True)
+    elif key_rel in proc and target is not proc:
+        proc[key_rel] = to_same_type(proc[key_rel], True)
+    else:
+        set_param(key_rel, True, default_type="bool")
+
+    # 2) layer_gcode: G92 E0 sicherstellen (schreibe dahin, wo Feld existiert)
+    def get_field(obj: dict, key: str) -> Optional[str]:
+        v = obj.get(key);  return v if isinstance(v, str) else None
+
+    lg_src = "proc" if "layer_gcode" in proc else ("target" if "layer_gcode" in target else None)
+    lg = get_field(proc, "layer_gcode") or get_field(target, "layer_gcode") or ""
     if "G92 E0" not in lg:
-        lg = (lg + "\nG92 E0\n").strip()
-    proc["layer_gcode"] = lg
+        lg = (lg.strip() + "\nG92 E0\n").strip()
+    if lg_src == "proc":
+        proc["layer_gcode"] = lg
+    else:
+        target["layer_gcode"] = lg
 
     # before_layer_gcode: G92 E0 entfernen
-    blg = (proc.get("before_layer_gcode") or "")
+    blg_src = "proc" if "before_layer_gcode" in proc else ("target" if "before_layer_gcode" in target else None)
+    blg = get_field(proc, "before_layer_gcode") or get_field(target, "before_layer_gcode") or ""
     if "G92 E0" in blg.upper():
         lines = [ln for ln in blg.splitlines() if "G92 E0" not in ln.upper()]
-        proc["before_layer_gcode"] = "\n".join(lines).strip()
+        blg_clean = "\n".join(lines).strip()
+        if blg_src == "proc":
+            proc["before_layer_gcode"] = blg_clean
+        elif blg_src == "target":
+            target["before_layer_gcode"] = blg_clean
 
-    # Negative Felder korrigieren
+    # 3) Negative Felder korrigieren
     for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
-        if k in proc:
+        if k in target:
+            v = target[k]
+            try:
+                fv = float(v) if isinstance(v, str) else float(v)
+            except Exception:
+                target[k] = to_same_type(v, 0)
+            else:
+                target[k] = to_same_type(v, 0 if fv < 0 else fv)
+        elif k in proc:
             v = proc[k]
             try:
                 fv = float(v) if isinstance(v, str) else float(v)
             except Exception:
-                set_typed(proc, k, 0)
+                proc[k] = to_same_type(v, 0)
             else:
-                set_typed(proc, k, 0 if fv < 0 else fv)
+                proc[k] = to_same_type(v, 0 if fv < 0 else fv)
 
-    # Infill
+    # 4) Infill in % setzen
     if fill_density_pct is not None:
-        if "fill_density" in proc:
-            set_typed(proc, "fill_density", int(max(0, min(100, fill_density_pct))))
+        k = "fill_density"
+        if k in target:
+            target[k] = to_same_type(target[k], int(max(0, min(100, fill_density_pct))))
+        elif k in proc:
+            proc[k] = to_same_type(proc[k], int(max(0, min(100, fill_density_pct))))
         else:
-            proc["fill_density"] = str(int(max(0, min(100, fill_density_pct))))
+            set_param(k, int(max(0, min(100, fill_density_pct))), default_type="number")
 
+    # 5) type/name sicherstellen (damit Orca es als process-Profil erkennt)
+    if "type" not in proc or (isinstance(proc.get("type"), str) and proc.get("type", "").strip() == ""):
+        proc["type"] = "process"
+    if "name" not in proc or (isinstance(proc.get("name"), str) and proc.get("name", "").strip() == ""):
+        proc["name"] = Path(src_path).stem + " (hardened)"
+
+    # 6) Speichern
     out = workdir / "process_hardened.json"
     save_json(out, proc)
     return str(out)
 
 # -----------------------------------------------------------------------------#
-#                         3MF-Sanitisierung (NEU)                              #
+#                         3MF-Sanitisierung                                    #
 # -----------------------------------------------------------------------------#
 def sanitize_3mf_remove_configs(src_bytes: bytes) -> bytes:
     """
@@ -595,7 +650,7 @@ async def estimate_time(
         settings_chain = [hardened_process, pick_printer]
         filament_chain = [pick_filament]
 
-        # --- MINIMALER ARG-SATZ ---
+        # --- Minimaler Arg-Satz ---
         base_min = [
             SLICER_BIN,
             "--datadir", str(datadir),
