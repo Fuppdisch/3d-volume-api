@@ -170,8 +170,34 @@ def set_typed(obj: dict, key: str, desired, default_type="string"):
             obj[key] = str(desired)
 
 # -----------------------------------------------------------------------------#
-#                         Process-Profil härten (FINAL)                        #
+#                         Printer-/Process-Profile härten                      #
 # -----------------------------------------------------------------------------#
+def harden_printer_profile(src_path: str, workdir: Path) -> str:
+    """
+    Printer-Profil so normalisieren, dass Orca es sicher als 'machine' erkennt.
+    - bevorzugt in 'settings' arbeiten (falls vorhanden)
+    - type='machine' + name setzen/sichern
+    - KEINE druckrelevanten Werte verändern
+    """
+    try:
+        prn = load_json(Path(src_path))
+    except Exception as e:
+        raise HTTPException(500, f"Printer-Profil ungültig: {e}")
+
+    # Zielknoten: settings (falls vorhanden), sonst Top-Level
+    settings = prn.get("settings")
+    _ = settings if isinstance(settings, dict) else prn  # wir verändern hier nichts weiter
+
+    # type/name sicherstellen
+    if "type" not in prn or (isinstance(prn.get("type"), str) and prn.get("type", "").strip() == ""):
+        prn["type"] = "machine"   # <- WICHTIG: Orca erwartet 'machine' für Drucker-Profile
+    if "name" not in prn or (isinstance(prn.get("name"), str) and prn.get("name", "").strip() == ""):
+        prn["name"] = Path(src_path).stem
+
+    out = workdir / "printer_hardened.json"
+    save_json(out, prn)
+    return str(out)
+
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
     Process-Profil härten, ohne die Orca-Struktur zu zerstören:
@@ -530,10 +556,7 @@ function openDocs(){ window.open(base + '/docs', '_blank'); }
 </script>
 """
 
-@app.get("/", response_class=HTMLResponse)
-def root_index():
-    return index()
-
+# ----------------------------- Health / Env -----------------------------------
 @app.get("/health", response_class=JSONResponse)
 def health():
     return {
@@ -644,10 +667,12 @@ async def estimate_time(
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        # Process-Profil härten + Infill setzen (typgerecht)
-        hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
+        # NEU: Printer & Process „härten“
+        hardened_printer  = harden_printer_profile(pick_printer, work)
+        hardened_process  = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
-        settings_chain = [hardened_process, pick_printer]
+        # Reihenfolge konsistent:
+        settings_chain = [hardened_process, hardened_printer]
         filament_chain = [pick_filament]
 
         # --- Minimaler Arg-Satz ---
