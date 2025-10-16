@@ -2,7 +2,6 @@
 import os
 import io
 import json
-import math
 import time
 import hashlib
 import zipfile
@@ -22,14 +21,14 @@ import numpy as np
 
 app = FastAPI(title="3D Print – Fixed Profiles Slicing API")
 
-# --- CORS ---------------------------------------------------------------------
+# --- CORS ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# --- ENV / Slicer Info --------------------------------------------------------
+# --- Slicer / Env ---
 SLICER_BIN = (
     os.getenv("SLICER_BIN")
     or os.getenv("ORCASLICER_BIN")
@@ -47,16 +46,11 @@ os.environ.setdefault(
     "/opt/orca/usr/bin:/opt/orca/bin:" + os.environ.get("PATH", "")
 )
 
-# --- Limits & Defaults --------------------------------------------------------
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 XVFB = shutil.which("xvfb-run") or "xvfb-run"
 
-# Materialdichten (g/cm³) – optional für spätere Kostenrechnung
-MATERIAL_DENSITY_G_CM3 = {"PLA": 1.24, "PETG": 1.27, "ASA": 1.07, "PC": 1.20}
-FILAMENT_DIAMETER_MM = 1.75
-
 # -----------------------------------------------------------------------------#
-#                              Helper / Utils                                  #
+#                                     Utils                                    #
 # -----------------------------------------------------------------------------#
 def sha256_of_bytes(buf: bytes) -> str:
     h = hashlib.sha256(); h.update(buf); return h.hexdigest()
@@ -73,7 +67,7 @@ def np_to_list(x) -> List[float]:
     return list(map(float, x))
 
 def find_profiles() -> Dict[str, List[str]]:
-    """Liste eure Profil-Dateien auf."""
+    """Finde Profil-Dateien im Container (/app/profiles)."""
     base = Path("/app/profiles")
     res = {"printer": [], "process": [], "filament": []}
     for key, sub in [("printer","printers"), ("process","process"), ("filament","filaments")]:
@@ -83,25 +77,26 @@ def find_profiles() -> Dict[str, List[str]]:
     return res
 
 def must_pick(profile_paths: List[str], label: str, wanted_name: Optional[str]) -> str:
-    """Wähle ein Profil. Wenn wanted_name gesetzt, muss es matchen."""
+    """Wähle ein Profil. Wenn wanted_name übergeben wurde, muss es matchen."""
     if wanted_name:
         for p in profile_paths:
-            if Path(p).name == wanted_name or wanted_name in Path(p).stem:
+            n = Path(p).name
+            if n == wanted_name or wanted_name in Path(p).stem:
                 return p
-        raise HTTPException(400, f"{label} '{wanted_name}' nicht gefunden.")
+        raise HTTPException(400, f"{label}-Profil '{wanted_name}' nicht gefunden.")
     if not profile_paths:
-        raise HTTPException(500, f"Kein {label}-Profil gefunden. Bitte /app/profiles/{label}s/*.json bereitstellen.")
+        raise HTTPException(500, f"Kein {label}-Profil vorhanden. Bitte /app/profiles/{label}s/*.json bereitstellen.")
     return profile_paths[0]
 
 def pick_filament_for_material(filament_paths: List[str], material: str) -> Optional[str]:
-    """Sucht ein Filament-Profil, dessen Dateiname das Material enthält (PLA/PETG/ASA/PC)."""
+    """Nimmt das Filament-Profil, dessen Dateiname den Materialstring enthält (PLA/PETG/ASA/PC)."""
     if not filament_paths:
         return None
     m = (material or "").strip().upper()
     for p in filament_paths:
         if m in Path(p).name.upper():
             return p
-    return filament_paths[0]  # Fallback: erstes
+    return filament_paths[0]
 
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
@@ -110,7 +105,7 @@ def save_json(p: Path, obj: dict):
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
 
 def percent_from_frac(x: float) -> int:
-    """0..1 -> 0..100 (begrenzen & runden)."""
+    """0..1 → 0..100 (gerundet, begrenzt)."""
     try:
         f = float(x)
     except Exception:
@@ -120,9 +115,7 @@ def percent_from_frac(x: float) -> int:
 
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
-    Lese euer Process-Profil, setze minimale, sichere Defaults,
-    überschreibe optional die Infill-Dichte (fill_density, in %),
-    und speichere als 'process_hardened.json'.
+    Process-Profil minimal härten + optional Infill-Dichte (in %) überschreiben.
     """
     try:
         proc = load_json(Path(src_path))
@@ -133,9 +126,9 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
         if key not in obj or obj[key] in (None, "", -1):
             obj[key] = val
 
-    # Robustheit: absolute E bevorzugen, G92 E0 in jeder Lage, negative Werte neutralisieren
-    set_if_missing(proc, "use_relative_e_distances", False)
-    lg = proc.get("layer_gcode", "") or ""
+    # Robustheit:
+    set_if_missing(proc, "use_relative_e_distances", False)  # absolute E
+    lg = (proc.get("layer_gcode") or "").strip()
     if "G92 E0" not in lg:
         proc["layer_gcode"] = (lg + "\nG92 E0\n").strip()
 
@@ -144,7 +137,6 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
         if isinstance(v, (int, float)) and v < 0:
             proc[k] = 0
 
-    # Kundeneingabe: Infill in Prozent (Orca/Prusa Key)
     if fill_density_pct is not None:
         proc["fill_density"] = int(max(0, min(100, fill_density_pct)))
 
@@ -153,7 +145,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
     return str(out)
 
 # -----------------------------------------------------------------------------#
-#                            Geometrie-Analyse                                 #
+#                               Analyse (STL/3MF)                              #
 # -----------------------------------------------------------------------------#
 def analyze_stl(data: bytes) -> Dict[str, Any]:
     mesh = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh")
@@ -260,14 +252,14 @@ def parse_slicedata_folder(folder: Path) -> Dict[str, Any]:
     return out
 
 # -----------------------------------------------------------------------------#
-#                                 UI / Health                                  #
+#                                UI / Health / Env                             #
 # -----------------------------------------------------------------------------#
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
 <!doctype html>
 <meta charset="utf-8">
-<title>3D Print – Fixed Profiles Slicing API</title>
+<title>3D Print – Fixed Profiles Slicing</title>
 <style>
   :root{--fg:#111827;--muted:#6b7280;--line:#e5e7eb;--bg:#f8fafc}
   body{font-family:system-ui,Segoe UI,Arial;margin:24px;line-height:1.45;color:var(--fg)}
@@ -365,8 +357,12 @@ function openDocs(){ window.open(base + '/docs', '_blank'); }
 
 @app.get("/health", response_class=JSONResponse)
 def health():
-    prof = find_profiles()
-    return {"ok": True, "slicer_bin": SLICER_BIN, "slicer_present": slicer_exists(), "profiles": prof}
+    return {
+        "ok": True,
+        "slicer_bin": SLICER_BIN,
+        "slicer_present": slicer_exists(),
+        "profiles": find_profiles()
+    }
 
 @app.get("/slicer_env", response_class=JSONResponse)
 def slicer_env():
@@ -394,12 +390,11 @@ async def analyze_upload(file: UploadFile = File(...)):
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"Datei > {MAX_FILE_BYTES // (1024*1024)} MB.")
 
-    sha = sha256_of_bytes(data)
     base_meta: Dict[str, Any] = {
         "ok": True,
         "filename": file.filename,
         "filesize_bytes": len(data),
-        "sha256": sha,
+        "sha256": sha256_of_bytes(data),
         "filetype": "stl" if filename.endswith(".stl") else "3mf",
         "generated_at": int(time.time())
     }
@@ -418,11 +413,9 @@ async def analyze_upload(file: UploadFile = File(...)):
 @app.post("/estimate_time", response_class=JSONResponse)
 async def estimate_time(
     file: UploadFile = File(...),
-    # Profile können optional per Dateiname vorgegeben werden; sonst Auto-Pick
     printer_profile: str = Form(None),
     process_profile: str = Form(None),
     filament_profile: str = Form(None),
-    # Kundeneingaben:
     material: str = Form("PLA"),  # PLA|PETG|ASA|PC
     infill: float = Form(0.35),   # 0..1 (z. B. 0.35 = 35%)
 ):
@@ -438,12 +431,10 @@ async def estimate_time(
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"Datei > {MAX_FILE_BYTES // (1024*1024)} MB.")
 
-    # Profile finden
     prof = find_profiles()
     pick_printer  = must_pick(prof["printer"],  "printer",  printer_profile)
     pick_process0 = must_pick(prof["process"],  "process",  process_profile)
 
-    # Filament: Kunde > Auto-Mapping auf Material > Fallback erstes Profil
     if filament_profile:
         pick_filament = must_pick(prof["filament"], "filament", filament_profile)
     else:
@@ -452,7 +443,6 @@ async def estimate_time(
             raise HTTPException(500, "Kein Filament-Profil vorhanden. Bitte /app/profiles/filaments/*.json bereitstellen.")
         pick_filament = auto_fil
 
-    # Infill % aus 0..1 ableiten
     infill_pct = percent_from_frac(infill)
     if infill_pct is None:
         raise HTTPException(400, "Ungültiger Infill-Wert. Erwartet 0..1, z. B. 0.35 für 35%.")
@@ -466,10 +456,8 @@ async def estimate_time(
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        # Process-Profil härten + INFILL überschreiben
         hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
-        # Settings-Chain
         settings_chain = [hardened_process, pick_printer]
         filament_chain = [pick_filament]
 
@@ -482,7 +470,7 @@ async def estimate_time(
                 "--export-slicedata", str(out_meta),
                 inp.as_posix()]
 
-        # IMMER slicen (Platte 0) und 3MF ablegen (für Debugging/Archiv)
+        # Platte 0 slicen und 3MF für Debug ablegen
         cmd = base + ["--slice", "0", "--export-3mf", str(out_3mf)]
 
         code, out, err = run([XVFB, "-a"] + cmd, timeout=900)
