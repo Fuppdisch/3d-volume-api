@@ -129,7 +129,7 @@ def normalize_opt_name(val: Optional[str]) -> Optional[str]:
     return str(val).strip()
 
 # -----------------------------------------------------------------------------#
-#                 Printer-/Process-Profile härten & kompatibel machen          #
+#                 Printer-/Process-/Filament-Profile härten                    #
 # -----------------------------------------------------------------------------#
 def harden_printer_profile(src_path: str, workdir: Path) -> str:
     """
@@ -179,7 +179,7 @@ def harden_process_profile(
     settings = proc.get("settings")
     target = settings if isinstance(settings, dict) else proc
 
-    # --- 0) Drucker-Metadaten abgreifen
+    # --- Drucker-Metadaten abgreifen
     prn = printer_json or {}
     nozzle_from_printer = None
     if isinstance(prn, dict):
@@ -202,7 +202,7 @@ def harden_process_profile(
     if nozzle_from_printer is None:
         nozzle_from_printer = 0.4
 
-    # --- 1) Relative E (als "1")
+    # Relative E = "1"
     key_rel = "use_relative_e_distances"
     if key_rel in target:
         target[key_rel] = "1"
@@ -211,7 +211,7 @@ def harden_process_profile(
     else:
         target[key_rel] = "1"
 
-    # --- 2) layer_gcode / before_layer_gcode
+    # layer_gcode / before_layer_gcode
     def get_field(obj: dict, key: str) -> Optional[str]:
         v = obj.get(key)
         return v if isinstance(v, str) else None
@@ -235,7 +235,7 @@ def harden_process_profile(
         elif blg_src == "target":
             target["before_layer_gcode"] = blg_clean
 
-    # --- 3) Negative Felder korrigieren
+    # Negative Felder korrigieren
     for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
         if k in target:
             v = target[k]
@@ -254,7 +254,7 @@ def harden_process_profile(
             else:
                 proc[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
 
-    # --- 4) Infill in % (als STRING)
+    # Infill in % (als STRING)
     if fill_density_pct is not None:
         val_str = str(int(max(0, min(100, fill_density_pct))))
         if "fill_density" in target:
@@ -264,7 +264,7 @@ def harden_process_profile(
         else:
             target["fill_density"] = val_str
 
-    # --- 5) Maschinen-Bindungen entfernen + Nozzle angleichen
+    # Maschinen-Bindungen entfernen + Nozzle angleichen
     kill_keys = [
         "compatible_printers", "compatible_printers_condition",
         "machine_name", "machine_series", "machine_type", "machine_technology",
@@ -286,7 +286,7 @@ def harden_process_profile(
     else:
         target["nozzle_diameter"] = str(nozzle_from_printer)
 
-    # --- 6) type/name setzen
+    # type/name setzen
     if "type" not in proc or (isinstance(proc.get("type"), str) and proc.get("type", "").strip() == ""):
         proc["type"] = "process"
     if "name" not in proc or (isinstance(proc.get("name"), str) and proc.get("name", "").strip() == ""):
@@ -294,6 +294,59 @@ def harden_process_profile(
 
     out = workdir / "process_hardened.json"
     save_json(out, proc)
+    return str(out)
+
+def harden_filament_profile(src_path: str, workdir: Path) -> str:
+    """
+    Filament-Profil so normalisieren, dass Orca es sicher als 'filament' erkennt.
+    - type='filament' + name setzen/sichern
+    - Kompatibilitäts-/Maschinen-Bindungen entfernen
+    - Problematische numerische Felder defensiv normalisieren
+    """
+    try:
+        fil = load_json(Path(src_path))
+    except Exception as e:
+        raise HTTPException(500, f"Filament-Profil ungültig: {e}")
+
+    if not isinstance(fil, dict):
+        raise HTTPException(500, "Filament-Profil hat kein JSON-Objekt als Wurzel.")
+
+    settings = fil.get("settings")
+    target = settings if isinstance(settings, dict) else fil
+
+    # type/name sicherstellen
+    if "type" not in fil or (isinstance(fil.get("type"), str) and fil.get("type", "").strip() == ""):
+        fil["type"] = "filament"
+    if "name" not in fil or (isinstance(fil.get("name"), str) and fil.get("name", "").strip() == ""):
+        fil["name"] = Path(src_path).stem
+
+    # Maschinen-/Kompatibilitäts-Bindungen entfernen
+    kill_keys = [
+        "compatible_printers", "compatible_printers_condition",
+        "machine_name", "machine_series", "machine_type", "machine_technology",
+        "machine_profile", "machine_kit", "hotend_type",
+        "printer_model", "printer_brand", "printer_series",
+        "inherits_from",
+    ]
+    for k in kill_keys:
+        if k in target: del target[k]
+        if k in fil:    del fil[k]
+
+    # Defensiv: einige numerische Felder normalisieren
+    for k in ("filament_density", "filament_diameter", "max_fan_speed", "min_fan_speed"):
+        if k in target:
+            try:
+                v = target[k]
+                fv = float(v) if not isinstance(v, str) else float(str(v).replace(",", "."))
+                if not np.isfinite(fv) or fv < 0:
+                    target[k] = "0"
+                else:
+                    target[k] = str(fv)
+            except Exception:
+                target[k] = "0"
+
+    out = workdir / "filament_hardened.json"
+    save_json(out, fil)
     return str(out)
 
 # -----------------------------------------------------------------------------#
@@ -672,10 +725,11 @@ async def estimate_time(
             fill_density_pct=infill_pct,
             printer_json=hardened_printer_json
         )
+        hardened_filament = harden_filament_profile(pick_filament, work)
 
         # Reihenfolge: PRINTER → PROCESS
         settings_chain = [hardened_printer, hardened_process]
-        filament_chain = [pick_filament]
+        filament_chain = [hardened_filament]
 
         base_min = [
             SLICER_BIN,
