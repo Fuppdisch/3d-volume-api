@@ -16,6 +16,7 @@
     "change_filament_gcode": "M600",
     "cooling_tube_length": "5",
     "cooling_tube_retraction": "91.5",
+    "default_bed_type": "",
     "default_filament_profile": [
         "RatRig Generic ABS"
     ],
@@ -26,6 +27,7 @@
     "disable_m73": "0",
     "emit_machine_limits_to_gcode": "1",
     "enable_filament_ramming": "1",
+    "enable_long_retraction_when_cut": "0",
     "extra_loading_move": "-2",
     "extruder_clearance_height_to_lid": "140",
     "extruder_clearance_height_to_rod": "25",
@@ -44,9 +46,12 @@
     "head_wrap_detect_zone": [],
     "high_current_on_filament_swap": "0",
     "host_type": "octoprint",
-    "inherits": "",
+    "inherits": "RatRig RatRig V-Core 3 400 0.4 nozzle",
     "is_custom_defined": "0",
     "layer_change_gcode": ";AFTER_LAYER_CHANGE\n;[layer_z]",
+    "long_retractions_when_cut": [
+        "0"
+    ],
     "machine_end_gcode": "END_PRINT",
     "machine_load_filament_time": "0",
     "machine_max_acceleration_e": [
@@ -93,6 +98,10 @@
         "0.4",
         "0.4"
     ],
+    "machine_max_junction_deviation": [
+        "0",
+        "0"
+    ],
     "machine_max_speed_e": [
         "60",
         "60"
@@ -117,49 +126,48 @@
         "0",
         "0"
     ],
-    "machine_pause_gcode": "M601",
+    "machine_pause_gcode": "PAUSE",
     "machine_start_gcode": "START_PRINT EXTRUDER_TEMP=[nozzle_temperature_initial_layer] BED_TEMP=[bed_temperature_initial_layer_single]",
+    "machine_tool_change_time": "0",
     "machine_unload_filament_time": "0",
-    "manual_filament_change": "0",
+    "manual_filament_change": "1",
     "max_layer_height": [
         "0.3"
     ],
+    "max_resonance_avoidance_speed": "120",
     "min_layer_height": [
         "0.05"
     ],
-    "name": "RatRig V-Core-3 400mm 0.4 nozzle",
+    "min_resonance_avoidance_speed": "70",
+    "name": "Homepage RatRig RatRig V-Core 3 400 0.4",
     "nozzle_diameter": [
         "0.4"
     ],
+    "nozzle_height": "2.5",
     "nozzle_hrc": "0",
     "nozzle_type": "undefine",
     "nozzle_volume": "0",
     "parking_pos_retraction": "92",
+    "pellet_modded_printer": "0",
     "preferred_orientation": "0",
-    "print_host": "",
-    "print_host_webui": "",
     "printable_area": [
-        "-200x-200",
-        "200x-200",
-        "200x200",
-        "-200x200"
+        "0x0",
+        "400x0",
+        "400x400",
+        "0x400"
     ],
     "printable_height": "400",
-    "printer_model": "RatRig V-Core-3 400mm",
+    "printer_model": "RatRig RatRig V-Core 3 400",
     "printer_notes": "",
-    "printer_settings_id": "RatRig V-Core-3 400mm 0.4 nozzle",
+    "printer_settings_id": "Homepage RatRig RatRig V-Core 3 400 0.4",
     "printer_structure": "undefine",
     "printer_technology": "FFF",
     "printer_variant": "0.4",
-    "printhost_apikey": "",
     "printhost_authorization_type": "key",
-    "printhost_cafile": "",
-    "printhost_password": "",
-    "printhost_port": "",
     "printhost_ssl_ignore_revoke": "0",
-    "printhost_user": "",
     "printing_by_object_gcode": "",
     "purge_in_prime_tower": "1",
+    "resonance_avoidance": "0",
     "retract_before_wipe": [
         "70%"
     ],
@@ -184,6 +192,9 @@
     "retract_when_changing_layer": [
         "1"
     ],
+    "retraction_distances_when_cut": [
+        "18"
+    ],
     "retraction_length": [
         "1"
     ],
@@ -200,16 +211,17 @@
     "support_chamber_temp_control": "1",
     "support_multi_bed_types": "0",
     "template_custom_gcode": "",
-    "thumbnails": [
-        "300x300"
-    ],
+    "thumbnails": "48x48/PNG,300x300/PNG",
     "thumbnails_format": "PNG",
     "time_cost": "0",
     "time_lapse_gcode": "",
+    "travel_slope": [
+        "3"
+    ],
     "upward_compatible_machine": [],
     "use_firmware_retraction": "0",
     "use_relative_e_distances": "1",
-    "version": "2.0.2.0",
+    "version": "2.3.1.10",
     "wipe": [
         "1"
     ],
