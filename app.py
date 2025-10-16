@@ -116,10 +116,6 @@ def percent_from_frac(x: float) -> int:
 
 # --- Typ-Helper: schreibe Werte im gleichen Typ, wie er im Profil existiert ---
 def to_same_type(old_val, new_val):
-    """
-    Konvertiere new_val in den Typ von old_val (so gut es geht),
-    weil Orca-Profile häufig Strings für Zahlen/Booleans verwenden.
-    """
     if isinstance(old_val, str):
         if isinstance(new_val, bool):
             return "1" if new_val else "0"
@@ -129,32 +125,21 @@ def to_same_type(old_val, new_val):
         except Exception:
             pass
         return str(new_val)
-
     if isinstance(old_val, bool):
         return bool(new_val)
-
     if isinstance(old_val, int):
         try:
             return int(round(float(new_val)))
         except Exception:
             return old_val
-
     if isinstance(old_val, float):
         try:
             return float(new_val)
         except Exception:
             return old_val
-
     return new_val
 
 def set_typed(obj: dict, key: str, desired, default_type="string"):
-    """
-    Setzt obj[key] auf desired, aber im Typ des existierenden Wertes.
-    Existiert key nicht, schreiben wir je nach default_type:
-      - "string": als String (robusteste Wahl)
-      - "number": als int/float
-      - "bool":   als "0"/"1" (String) oder echtes bool
-    """
     if key in obj:
         obj[key] = to_same_type(obj[key], desired)
     else:
@@ -175,18 +160,15 @@ def set_typed(obj: dict, key: str, desired, default_type="string"):
 def harden_printer_profile(src_path: str, workdir: Path) -> str:
     """
     Printer-Profil so normalisieren, dass Orca es sicher als 'machine' erkennt.
-    - bevorzugt in 'settings' arbeiten (falls vorhanden)
     - type='machine' + name setzen/sichern
-    - KEINE druckrelevanten Werte verändern
     """
     try:
         prn = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Printer-Profil ungültig: {e}")
 
-    # type/name sicherstellen
     if "type" not in prn or (isinstance(prn.get("type"), str) and prn.get("type", "").strip() == ""):
-        prn["type"] = "machine"   # <- WICHTIG: Orca erwartet 'machine' für Drucker-Profile
+        prn["type"] = "machine"
     if "name" not in prn or (isinstance(prn.get("name"), str) and prn.get("name", "").strip() == ""):
         prn["name"] = Path(src_path).stem
 
@@ -196,23 +178,21 @@ def harden_printer_profile(src_path: str, workdir: Path) -> str:
 
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
-    Process-Profil härten, ohne die Orca-Struktur zu zerstören:
-    - Bevorzugt im "settings"-Block arbeiten (falls vorhanden).
+    Process-Profil härten:
     - type="process" + name setzen/sichern.
-    - Relative E aktivieren, G92 E0 in layer_gcode (pro Layer), G92 E0 aus before_layer_gcode entfernen.
-    - Negative Parameter auf 0 setzen (typgerecht).
-    - fill_density als **String** in % setzen (typgerecht für strikte Exporte).
+    - Relative E aktivieren ("1"), G92 E0 in layer_gcode; G92 E0 aus before_layer_gcode entfernen.
+    - Negative Parameter auf 0 setzen.
+    - fill_density als **String** in % setzen.
     """
     try:
         proc = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
-    # Zielknoten: settings (falls vorhanden), sonst Top-Level
     settings = proc.get("settings")
     target = settings if isinstance(settings, dict) else proc
 
-    # 1) Relative E aktivieren  (immer als "1")
+    # 1) Relative E (als "1")
     key_rel = "use_relative_e_distances"
     if key_rel in target:
         target[key_rel] = "1"
@@ -221,7 +201,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
     else:
         target[key_rel] = "1"
 
-    # 2) layer_gcode: G92 E0 sicherstellen (schreibe dahin, wo Feld existiert)
+    # 2) layer_gcode: G92 E0 sicherstellen
     def get_field(obj: dict, key: str) -> Optional[str]:
         v = obj.get(key);  return v if isinstance(v, str) else None
 
@@ -264,7 +244,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
             else:
                 proc[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
 
-    # 4) Infill in % setzen  (immer als STRING!)
+    # 4) Infill in % (immer als STRING)
     if fill_density_pct is not None:
         k = "fill_density"
         val_str = str(int(max(0, min(100, fill_density_pct))))
@@ -275,13 +255,12 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
         else:
             target[k] = val_str
 
-    # 5) type/name sicherstellen (damit Orca es als process-Profil erkennt)
+    # 5) type/name sicherstellen
     if "type" not in proc or (isinstance(proc.get("type"), str) and proc.get("type", "").strip() == ""):
         proc["type"] = "process"
     if "name" not in proc or (isinstance(proc.get("name"), str) and proc.get("name", "").strip() == ""):
         proc["name"] = Path(src_path).stem + " (hardened)"
 
-    # 6) Speichern
     out = workdir / "process_hardened.json"
     save_json(out, proc)
     return str(out)
@@ -292,9 +271,6 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
 def sanitize_3mf_remove_configs(src_bytes: bytes) -> bytes:
     """
     Entfernt Config-/Metadata-Anteile aus einer 3MF-ZIP, damit NUR unsere festen Profile greifen.
-    - Entfernt Ordner/Dateien namens 'config/*' und 'metadata/*'
-    - Entfernt JSON/INI, die 'config'/'setting'/'profile' im Pfad tragen
-    - Bereinigt 3D/3dmodel.model von <metadata>-Blöcken
     """
     src = io.BytesIO(src_bytes)
     with zipfile.ZipFile(src, "r") as zin:
@@ -304,20 +280,16 @@ def sanitize_3mf_remove_configs(src_bytes: bytes) -> bytes:
                 name = info.filename
                 lower = name.lower()
 
-                # Ordner pauschal ausschließen
                 if lower.startswith("config/") or "/config/" in lower:
                     continue
                 if lower.startswith("metadata/") or "/metadata/" in lower:
                     continue
-
-                # Einzeldateien mit offensichtlichen Configs
                 if (lower.endswith(".json") or lower.endswith(".ini")) and \
                    any(tok in lower for tok in ("config", "setting", "profile")):
                     continue
 
                 data = zin.read(name)
 
-                # Model-XML: alle <metadata> löschen (robust per Regex)
                 if lower in ("3d/3dmodel.model", "3d/model.model", "3d/model"):
                     try:
                         s = data.decode("utf-8", errors="ignore")
@@ -625,7 +597,6 @@ async def estimate_time(
             raise HTTPException(500, "Kein Filament-Profil vorhanden. Bitte /app/profiles/filaments/*.json bereitstellen.")
         pick_filament = auto_fil
 
-    # Infill-Prozent 0..100
     infill_pct = percent_from_frac(infill)
     if infill_pct is None:
         raise HTTPException(400, "Ungültiger Infill-Wert. Erwartet 0..1, z. B. 0.35 für 35%.")
@@ -635,7 +606,6 @@ async def estimate_time(
         is_3mf = filename.endswith(".3mf")
         inp = work / ("input.3mf" if is_3mf else "input.stl")
 
-        # 3MF vor dem Schreiben sanieren
         if is_3mf:
             data_sane = sanitize_3mf_remove_configs(data)
             inp.write_bytes(data_sane)
@@ -646,15 +616,13 @@ async def estimate_time(
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        # Profile „härten“
         hardened_printer  = harden_printer_profile(pick_printer, work)
         hardened_process  = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
-        # Ladereihenfolge: PRINTER -> PROCESS (wichtiger Fix!)
+        # Reihenfolge: PRINTER → PROCESS
         settings_chain = [hardened_printer, hardened_process]
         filament_chain = [pick_filament]
 
-        # --- Minimaler Arg-Satz ---
         base_min = [
             SLICER_BIN,
             "--datadir", str(datadir),
@@ -670,7 +638,6 @@ async def estimate_time(
         tail = (err or out)[-2000:]
         last_cmd = " ".join(full_min)
 
-        # --- Fallback bei „No such file: 1“ ---
         if code != 0 and "No such file: 1" in tail:
             base_ultra = [
                 SLICER_BIN,
