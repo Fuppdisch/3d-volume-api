@@ -330,11 +330,6 @@ async function hit(path, sel){
     out.textContent = isJson ? JSON.stringify(await r.json(), null, 2) : await r.text();
   }catch(e){ out.textContent = 'Fehler: ' + e; }
 }
-function formToJSON(form){
-  const fd = new FormData(form); const obj = {};
-  for (const [k,v] of fd.entries()){ obj[k]=v; }
-  return obj;
-}
 async function sendAnalyze(e){
   e.preventDefault();
   const fd = new FormData(e.target);
@@ -461,22 +456,34 @@ async def estimate_time(
         settings_chain = [hardened_process, pick_printer]
         filament_chain = [pick_filament]
 
-        base = [
+        # --- MINIMALER ARG-SATZ ---
+        base_min = [
             SLICER_BIN,
             "--datadir", str(datadir),
-            "--info",
-            "--allow-newer-file",          # <— ohne "1"
             "--load-settings", ";".join(settings_chain),
             "--load-filaments", ";".join(filament_chain),
             "--export-slicedata", str(out_meta),
             inp.as_posix(),
         ]
+        cmd_min = base_min + ["--slice", "0", "--export-3mf", str(out_3mf)]
 
-        # Platte 0 slicen und 3MF für Debug ablegen
-        cmd = base + ["--slice", "0", "--export-3mf", str(out_3mf)]
-
-        code, out, err = run([XVFB, "-a"] + cmd, timeout=900)
+        code, out, err = run([XVFB, "-a"] + cmd_min, timeout=900)
         tail = (err or out)[-800:]
+
+        # --- Fallback bei „No such file: 1“ ---
+        if code != 0 and "No such file: 1" in tail:
+            base_ultra = [
+                SLICER_BIN,
+                "--datadir", str(datadir),
+                "--load-settings", ";".join(settings_chain),
+                "--load-filaments", ";".join(filament_chain),
+                inp.as_posix(),
+            ]
+            cmd_ultra = base_ultra + ["--slice", "0", "--export-3mf", str(out_3mf), "--export-slicedata", str(out_meta)]
+            code2, out2, err2 = run([XVFB, "-a"] + cmd_ultra, timeout=900)
+            tail2 = (err2 or out2)[-800:]
+            code, out, err, tail = code2, out2, err2, tail2
+
         if code != 0:
             raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {tail}")
 
@@ -497,7 +504,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0), Filament & Infill aus Kundeneingabe."
+            "notes": "Gesliced mit festen Profilen (--slice 0). Minimal-Args; Fallback aktiv falls nötig."
         }
     finally:
         try: shutil.rmtree(work, ignore_errors=True)
