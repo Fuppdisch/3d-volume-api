@@ -184,10 +184,6 @@ def harden_printer_profile(src_path: str, workdir: Path) -> str:
     except Exception as e:
         raise HTTPException(500, f"Printer-Profil ungültig: {e}")
 
-    # Zielknoten: settings (falls vorhanden), sonst Top-Level
-    settings = prn.get("settings")
-    _ = settings if isinstance(settings, dict) else prn  # wir verändern hier nichts weiter
-
     # type/name sicherstellen
     if "type" not in prn or (isinstance(prn.get("type"), str) and prn.get("type", "").strip() == ""):
         prn["type"] = "machine"   # <- WICHTIG: Orca erwartet 'machine' für Drucker-Profile
@@ -205,7 +201,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
     - type="process" + name setzen/sichern.
     - Relative E aktivieren, G92 E0 in layer_gcode (pro Layer), G92 E0 aus before_layer_gcode entfernen.
     - Negative Parameter auf 0 setzen (typgerecht).
-    - fill_density in % setzen (typgerecht).
+    - fill_density als **String** in % setzen (typgerecht für strikte Exporte).
     """
     try:
         proc = load_json(Path(src_path))
@@ -216,32 +212,14 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
     settings = proc.get("settings")
     target = settings if isinstance(settings, dict) else proc
 
-    def set_param(key: str, value, default_type="string"):
-        if key in target:
-            target[key] = to_same_type(target[key], value)
-        else:
-            if key in proc and target is not proc:
-                target[key] = to_same_type(proc[key], value)
-            else:
-                if default_type == "bool":
-                    target[key] = "1" if bool(value) else "0"
-                elif default_type == "number":
-                    try:
-                        f = float(value)
-                        target[key] = int(round(f)) if f.is_integer() else f
-                    except Exception:
-                        target[key] = str(value)
-                else:
-                    target[key] = str(value)
-
-    # 1) Relative E aktivieren
+    # 1) Relative E aktivieren  (immer als "1")
     key_rel = "use_relative_e_distances"
     if key_rel in target:
-        target[key_rel] = to_same_type(target[key_rel], True)
+        target[key_rel] = "1"
     elif key_rel in proc and target is not proc:
-        proc[key_rel] = to_same_type(proc[key_rel], True)
+        proc[key_rel] = "1"
     else:
-        set_param(key_rel, True, default_type="bool")
+        target[key_rel] = "1"
 
     # 2) layer_gcode: G92 E0 sicherstellen (schreibe dahin, wo Feld existiert)
     def get_field(obj: dict, key: str) -> Optional[str]:
@@ -274,27 +252,28 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Op
             try:
                 fv = float(v) if isinstance(v, str) else float(v)
             except Exception:
-                target[k] = to_same_type(v, 0)
+                target[k] = "0"
             else:
-                target[k] = to_same_type(v, 0 if fv < 0 else fv)
+                target[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
         elif k in proc:
             v = proc[k]
             try:
                 fv = float(v) if isinstance(v, str) else float(v)
             except Exception:
-                proc[k] = to_same_type(v, 0)
+                proc[k] = "0"
             else:
-                proc[k] = to_same_type(v, 0 if fv < 0 else fv)
+                proc[k] = "0" if fv < 0 else str(int(round(fv))) if float(fv).is_integer() else str(float(fv))
 
-    # 4) Infill in % setzen
+    # 4) Infill in % setzen  (immer als STRING!)
     if fill_density_pct is not None:
         k = "fill_density"
+        val_str = str(int(max(0, min(100, fill_density_pct))))
         if k in target:
-            target[k] = to_same_type(target[k], int(max(0, min(100, fill_density_pct))))
+            target[k] = val_str
         elif k in proc:
-            proc[k] = to_same_type(proc[k], int(max(0, min(100, fill_density_pct))))
+            proc[k] = val_str
         else:
-            set_param(k, int(max(0, min(100, fill_density_pct))), default_type="number")
+            target[k] = val_str
 
     # 5) type/name sicherstellen (damit Orca es als process-Profil erkennt)
     if "type" not in proc or (isinstance(proc.get("type"), str) and proc.get("type", "").strip() == ""):
@@ -667,12 +646,12 @@ async def estimate_time(
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        # NEU: Printer & Process „härten“
+        # Profile „härten“
         hardened_printer  = harden_printer_profile(pick_printer, work)
         hardened_process  = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
-        # Reihenfolge konsistent:
-        settings_chain = [hardened_process, hardened_printer]
+        # Ladereihenfolge: PRINTER -> PROCESS (wichtiger Fix!)
+        settings_chain = [hardened_printer, hardened_process]
         filament_chain = [pick_filament]
 
         # --- Minimaler Arg-Satz ---
@@ -753,7 +732,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0). 3MF-Configs entfernt. Fallback aktiv falls nötig."
+            "notes": "Gesliced mit festen Profilen (--slice 0). 3MF-Configs entfernt. Reihenfolge: Printer→Process. Fallback aktiv."
         }
         if debug:
             resp["cmd"] = last_cmd
