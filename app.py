@@ -1,7 +1,6 @@
 # ---------- app.py ----------
 import os
 import io
-import re
 import json
 import math
 import time
@@ -17,14 +16,11 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Optional: für 3MF-XML
 import xml.etree.ElementTree as ET
-
-# Für STL-Analyse
 import trimesh
 import numpy as np
 
-app = FastAPI(title="3D Print – Upload, Time & Cost API")
+app = FastAPI(title="3D Print – Fixed Profiles Slicing API")
 
 # --- CORS ---------------------------------------------------------------------
 app.add_middleware(
@@ -41,6 +37,7 @@ SLICER_BIN = (
     or "/usr/local/bin/orca-slicer"
 )
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
 os.environ.setdefault(
     "LD_LIBRARY_PATH",
     "/opt/orca/usr/lib:/opt/orca/lib:" + os.environ.get("LD_LIBRARY_PATH", "")
@@ -54,16 +51,13 @@ os.environ.setdefault(
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 XVFB = shutil.which("xvfb-run") or "xvfb-run"
 
-# Materialdichten (g/cm^3) – konservativ; kann später via Config überschrieben werden
-MATERIAL_DENSITY_G_CM3 = {
-    "PLA": 1.24,
-    "PETG": 1.27,
-    "ASA": 1.07,
-    "PC": 1.20,
-}
-FILAMENT_DIAMETER_MM = 1.75  # typisch
+# Materialdichten (g/cm³) – optional für spätere Kostenrechnung
+MATERIAL_DENSITY_G_CM3 = {"PLA": 1.24, "PETG": 1.27, "ASA": 1.07, "PC": 1.20}
+FILAMENT_DIAMETER_MM = 1.75
 
-# --- Helpers ------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#                              Helper / Utils                                  #
+# -----------------------------------------------------------------------------#
 def sha256_of_bytes(buf: bytes) -> str:
     h = hashlib.sha256(); h.update(buf); return h.hexdigest()
 
@@ -78,10 +72,89 @@ def run(cmd: List[str], timeout: int = 900) -> Tuple[int, str, str]:
 def np_to_list(x) -> List[float]:
     return list(map(float, x))
 
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
+def find_profiles() -> Dict[str, List[str]]:
+    """Liste eure Profil-Dateien auf."""
+    base = Path("/app/profiles")
+    res = {"printer": [], "process": [], "filament": []}
+    for key, sub in [("printer","printers"), ("process","process"), ("filament","filaments")]:
+        d = base / sub
+        if d.exists():
+            res[key] = sorted(str(p) for p in d.glob("*.json"))
+    return res
 
-# ---- STL Analyse -------------------------------------------------------------
+def must_pick(profile_paths: List[str], label: str, wanted_name: Optional[str]) -> str:
+    """Wähle ein Profil. Wenn wanted_name gesetzt, muss es matchen."""
+    if wanted_name:
+        for p in profile_paths:
+            if Path(p).name == wanted_name or wanted_name in Path(p).stem:
+                return p
+        raise HTTPException(400, f"{label} '{wanted_name}' nicht gefunden.")
+    if not profile_paths:
+        raise HTTPException(500, f"Kein {label}-Profil gefunden. Bitte /app/profiles/{label}s/*.json bereitstellen.")
+    return profile_paths[0]
+
+def pick_filament_for_material(filament_paths: List[str], material: str) -> Optional[str]:
+    """Sucht ein Filament-Profil, dessen Dateiname das Material enthält (PLA/PETG/ASA/PC)."""
+    if not filament_paths:
+        return None
+    m = (material or "").strip().upper()
+    for p in filament_paths:
+        if m in Path(p).name.upper():
+            return p
+    return filament_paths[0]  # Fallback: erstes
+
+def load_json(p: Path) -> dict:
+    return json.loads(p.read_text(encoding="utf-8"))
+
+def save_json(p: Path, obj: dict):
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+
+def percent_from_frac(x: float) -> int:
+    """0..1 -> 0..100 (begrenzen & runden)."""
+    try:
+        f = float(x)
+    except Exception:
+        return None
+    f = max(0.0, min(1.0, f))
+    return int(round(f * 100))
+
+def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
+    """
+    Lese euer Process-Profil, setze minimale, sichere Defaults,
+    überschreibe optional die Infill-Dichte (fill_density, in %),
+    und speichere als 'process_hardened.json'.
+    """
+    try:
+        proc = load_json(Path(src_path))
+    except Exception as e:
+        raise HTTPException(500, f"Process-Profil ungültig: {e}")
+
+    def set_if_missing(obj, key, val):
+        if key not in obj or obj[key] in (None, "", -1):
+            obj[key] = val
+
+    # Robustheit: absolute E bevorzugen, G92 E0 in jeder Lage, negative Werte neutralisieren
+    set_if_missing(proc, "use_relative_e_distances", False)
+    lg = proc.get("layer_gcode", "") or ""
+    if "G92 E0" not in lg:
+        proc["layer_gcode"] = (lg + "\nG92 E0\n").strip()
+
+    for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
+        v = proc.get(k, None)
+        if isinstance(v, (int, float)) and v < 0:
+            proc[k] = 0
+
+    # Kundeneingabe: Infill in Prozent (Orca/Prusa Key)
+    if fill_density_pct is not None:
+        proc["fill_density"] = int(max(0, min(100, fill_density_pct)))
+
+    out = workdir / "process_hardened.json"
+    save_json(out, proc)
+    return str(out)
+
+# -----------------------------------------------------------------------------#
+#                            Geometrie-Analyse                                 #
+# -----------------------------------------------------------------------------#
 def analyze_stl(data: bytes) -> Dict[str, Any]:
     mesh = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh")
     if isinstance(mesh, trimesh.Scene):
@@ -111,15 +184,10 @@ def analyze_stl(data: bytes) -> Dict[str, Any]:
         "units_assumed": "mm",
     }
 
-# ---- 3MF Analyse -------------------------------------------------------------
 def analyze_3mf(data: bytes) -> Dict[str, Any]:
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         namelist = zf.namelist()
-        model_xml_name = None
-        for cand in ("3D/3dmodel.model", "3d/3dmodel.model", "3D/Model.model"):
-            if cand in namelist:
-                model_xml_name = cand
-                break
+        model_xml_name = next((c for c in ("3D/3dmodel.model", "3d/3dmodel.model", "3D/Model.model") if c in namelist), None)
 
         res: Dict[str, Any] = {
             "zip_entries": len(namelist),
@@ -153,9 +221,7 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
                 out_objects.append({"id": oid, "type": typ, "triangles": 0}); continue
 
             tris = mesh_elem.find("m:triangles", ns) if ns else mesh_elem.find("triangles")
-            tri_count = 0
-            if tris is not None:
-                tri_count = len(tris.findall("m:triangle", ns) if ns else tris.findall("triangle"))
+            tri_count = len(tris.findall("m:triangle", ns) if ns else tris.findall("triangle")) if tris is not None else 0
             tri_total += tri_count
 
             bbox = None
@@ -180,7 +246,6 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
         res["objects"] = out_objects
         return res
 
-# ---- Slicedata Parser --------------------------------------------------------
 def parse_slicedata_folder(folder: Path) -> Dict[str, Any]:
     out = {"duration_s": None, "filament_mm": None, "filament_g": None, "files": []}
     for jf in sorted(folder.glob("*.json")):
@@ -194,41 +259,30 @@ def parse_slicedata_folder(folder: Path) -> Dict[str, Any]:
             pass
     return out
 
-# ---- Filament mm → g ---------------------------------------------------------
-def filament_mm_to_g(filament_mm: float, material: str = "PLA") -> Optional[float]:
-    if filament_mm is None:
-        return None
-    mat = (material or "PLA").upper()
-    rho = MATERIAL_DENSITY_G_CM3.get(mat, MATERIAL_DENSITY_G_CM3["PLA"])  # g/cm3
-    d_mm = FILAMENT_DIAMETER_MM
-    area_mm2 = math.pi * (d_mm / 2.0) ** 2
-    vol_mm3 = filament_mm * area_mm2                      # mm3
-    vol_cm3 = vol_mm3 / 1000.0                            # 1000 mm3 = 1 cm3
-    grams = vol_cm3 * rho
-    return grams
-
-# --- Mini UI ------------------------------------------------------------------
+# -----------------------------------------------------------------------------#
+#                                 UI / Health                                  #
+# -----------------------------------------------------------------------------#
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
 <!doctype html>
 <meta charset="utf-8">
-<title>3D Print – Upload, Zeit & Kosten</title>
+<title>3D Print – Fixed Profiles Slicing API</title>
 <style>
   :root{--fg:#111827;--muted:#6b7280;--line:#e5e7eb;--bg:#f8fafc}
   body{font-family:system-ui,Segoe UI,Arial;margin:24px;line-height:1.45;color:var(--fg)}
   h1{margin:0 0 16px;font-size:22px}
-  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(320px,1fr))}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(360px,1fr))}
   .card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fff}
   button,input[type=submit]{padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:#111827;color:#fff;cursor:pointer}
   button.secondary{background:#fff;color:#111827}
   label{font-weight:600;margin-right:8px}
-  input[type=number],select{padding:8px 10px;border:1px solid var(--line);border-radius:10px}
+  input[type=number],select,input[type=text]{padding:8px 10px;border:1px solid var(--line);border-radius:10px}
   pre{white-space:pre-wrap;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:12px;max-height:360px;overflow:auto}
   small{color:var(--muted)}
 </style>
 
-<h1>3D Print – Upload, Zeit & Kosten</h1>
+<h1>3D Print – Fixed Profiles Slicing</h1>
 <div class="grid">
   <div class="card">
     <button class="secondary" onclick="openDocs()">Swagger (API-Doku)</button>
@@ -246,36 +300,27 @@ def index():
   </div>
 
   <div class="card">
-    <h3>Druckzeit schätzen (/estimate_time)</h3>
+    <h3>Druckzeit mit festen Profilen (/estimate_time)</h3>
     <form onsubmit="return sendTime(event)">
       <input type="file" name="file" accept=".stl,.3mf" required>
-      <select name="force_slice">
-        <option value="auto" selected>auto (fallback mit --slice 0)</option>
-        <option value="always">immer --slice 0</option>
-      </select>
+      <div style="margin:8px 0">
+        <label>Material</label>
+        <select name="material">
+          <option>PLA</option><option>PETG</option><option>ASA</option><option>PC</option>
+        </select>
+        <label>Infill</label><input name="infill" type="number" step="0.01" value="0.35" style="width:120px">
+      </div>
+      <div style="margin:8px 0">
+        <label>Printer-Profil</label><input name="printer_profile" placeholder="optional: Dateiname">
+      </div>
+      <div style="margin:8px 0">
+        <label>Process-Profil</label><input name="process_profile" placeholder="optional: Dateiname">
+      </div>
+      <div style="margin:8px 0">
+        <label>Filament-Profil</label><input name="filament_profile" placeholder="optional: Dateiname">
+      </div>
       <input type="submit" value="Zeit ermitteln">
-      <div><small>Output: duration_s, filament_mm/g (wenn vorhanden)</small></div>
-    </form>
-  </div>
-
-  <div class="card">
-    <h3>Kosten schätzen (/estimate_cost)</h3>
-    <form onsubmit="return sendCost(event)">
-      <label>Dauer (s)</label><input type="number" name="duration_s" step="1" required><br><br>
-      <label>Material</label>
-      <select name="material">
-        <option>PLA</option><option>PETG</option><option>ASA</option><option>PC</option>
-      </select>
-      <label>filament_g</label><input type="number" name="filament_g" step="0.01">
-      <label>oder filament_mm</label><input type="number" name="filament_mm" step="1">
-      <br><br>
-      <label>€/h Maschine</label><input type="number" name="machine_rate_eur_h" step="0.01" value="6.00">
-      <label>€/kg Material</label><input type="number" name="material_eur_kg" step="0.01" value="22.00"><br><br>
-      <label>kWh/h</label><input type="number" name="energy_kwh_per_h" step="0.01" value="0.10">
-      <label>€/kWh</label><input type="number" name="energy_eur_per_kwh" step="0.01" value="0.35"><br><br>
-      <label>Setup €</label><input type="number" name="setup_fee_eur" step="0.01" value="0.00">
-      <label>Risiko %</label><input type="number" name="risk_pct" step="0.1" value="0">
-      <br><br><input type="submit" value="Kosten berechnen">
+      <div><small>Es werden ausschließlich eure Profile geladen. Infill & Material kommen aus der Kundeneingabe.</small></div>
     </form>
   </div>
 </div>
@@ -284,7 +329,6 @@ def index():
 
 <script>
 const base = location.origin;
-
 async function hit(path, sel){
   const out = document.querySelector(sel || '#out');
   out.textContent = 'Lade ' + path + ' …';
@@ -294,57 +338,35 @@ async function hit(path, sel){
     out.textContent = isJson ? JSON.stringify(await r.json(), null, 2) : await r.text();
   }catch(e){ out.textContent = 'Fehler: ' + e; }
 }
-
 function formToJSON(form){
   const fd = new FormData(form); const obj = {};
   for (const [k,v] of fd.entries()){ obj[k]=v; }
   return obj;
 }
-
 async function sendAnalyze(e){
-  e.preventDefault(); const fd = new FormData(e.target);
+  e.preventDefault();
+  const fd = new FormData(e.target);
   const out = document.querySelector('#out'); out.textContent='Analysiere …';
   try{ const r = await fetch(base+'/analyze_upload',{method:'POST',body:fd});
        out.textContent = JSON.stringify(await r.json(), null, 2);
   }catch(err){ out.textContent='Fehler: '+err; } return false;
 }
-
 async function sendTime(e){
-  e.preventDefault(); const fd = new FormData(e.target);
-  const out = document.querySelector('#out'); out.textContent='Zeit schätzen …';
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const out = document.querySelector('#out'); out.textContent='Slicen …';
   try{ const r = await fetch(base+'/estimate_time',{method:'POST',body:fd});
        out.textContent = JSON.stringify(await r.json(), null, 2);
   }catch(err){ out.textContent='Fehler: '+err; } return false;
 }
-
-async function sendCost(e){
-  e.preventDefault();
-  const out = document.querySelector('#out'); out.textContent='Kosten berechnen …';
-  const obj = formToJSON(e.target);
-  // leere Strings entfernen
-  Object.keys(obj).forEach(k=>{ if(obj[k]==='') delete obj[k]; });
-  // numerisch
-  ["duration_s","filament_g","filament_mm","machine_rate_eur_h","material_eur_kg","energy_kwh_per_h","energy_eur_per_kwh","setup_fee_eur","risk_pct"].forEach(k=>{
-    if(obj[k]!==undefined) obj[k]=Number(obj[k]);
-  });
-  try{
-    const r = await fetch(base+'/estimate_cost',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(obj)});
-    out.textContent = JSON.stringify(await r.json(), null, 2);
-  }catch(err){ out.textContent='Fehler: '+err; } return false;
-}
-
 function openDocs(){ window.open(base + '/docs', '_blank'); }
 </script>
 """
 
-# --- Health / Slicer-Env (nur Info) ------------------------------------------
 @app.get("/health", response_class=JSONResponse)
 def health():
-    return {
-        "ok": True,
-        "slicer_bin": SLICER_BIN,
-        "slicer_present": slicer_exists(),
-    }
+    prof = find_profiles()
+    return {"ok": True, "slicer_bin": SLICER_BIN, "slicer_present": slicer_exists(), "profiles": prof}
 
 @app.get("/slicer_env", response_class=JSONResponse)
 def slicer_env():
@@ -359,7 +381,7 @@ def slicer_env():
         info["help_snippet"] = f"(help not available) {e}"
     return info
 
-# --- Upload-Analyse -----------------------------------------------------------
+# ----------------------------- Upload Analyse ---------------------------------
 @app.post("/analyze_upload", response_class=JSONResponse)
 async def analyze_upload(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
@@ -392,17 +414,18 @@ async def analyze_upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"Analyse fehlgeschlagen: {e}")
 
-# --- Zeitabschätzung (Orca, nur Slicedata) -----------------------------------
+# ----------------------------- Slicing/Timing --------------------------------
 @app.post("/estimate_time", response_class=JSONResponse)
 async def estimate_time(
     file: UploadFile = File(...),
-    force_slice: str = Form("auto"),  # "auto" | "always"
+    # Profile können optional per Dateiname vorgegeben werden; sonst Auto-Pick
+    printer_profile: str = Form(None),
+    process_profile: str = Form(None),
+    filament_profile: str = Form(None),
+    # Kundeneingaben:
+    material: str = Form("PLA"),  # PLA|PETG|ASA|PC
+    infill: float = Form(0.35),   # 0..1 (z. B. 0.35 = 35%)
 ):
-    """
-    Minimaler Orca-Aufruf, um Slicedata (print_time_sec, filament_mm/g) zu extrahieren.
-    - Kein Laden externer Profile
-    - Erst ohne --slice; wenn keine Zeit → Fallback mit --slice 0
-    """
     if not slicer_exists():
         raise HTTPException(500, "OrcaSlicer CLI nicht verfügbar.")
 
@@ -415,140 +438,77 @@ async def estimate_time(
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"Datei > {MAX_FILE_BYTES // (1024*1024)} MB.")
 
-    work = Path(tempfile.mkdtemp(prefix="etime_"))
+    # Profile finden
+    prof = find_profiles()
+    pick_printer  = must_pick(prof["printer"],  "printer",  printer_profile)
+    pick_process0 = must_pick(prof["process"],  "process",  process_profile)
+
+    # Filament: Kunde > Auto-Mapping auf Material > Fallback erstes Profil
+    if filament_profile:
+        pick_filament = must_pick(prof["filament"], "filament", filament_profile)
+    else:
+        auto_fil = pick_filament_for_material(prof["filament"], material)
+        if not auto_fil:
+            raise HTTPException(500, "Kein Filament-Profil vorhanden. Bitte /app/profiles/filaments/*.json bereitstellen.")
+        pick_filament = auto_fil
+
+    # Infill % aus 0..1 ableiten
+    infill_pct = percent_from_frac(infill)
+    if infill_pct is None:
+        raise HTTPException(400, "Ungültiger Infill-Wert. Erwartet 0..1, z. B. 0.35 für 35%.")
+
+    work = Path(tempfile.mkdtemp(prefix="fixedp_"))
     try:
         is_3mf = filename.endswith(".3mf")
         inp = work / ("input.3mf" if is_3mf else "input.stl")
         inp.write_bytes(data)
         out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
         out_3mf  = work / "out.3mf"
+        datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        def base_cmd():
-            return [SLICER_BIN, "--info", "--export-slicedata", str(out_meta), inp.as_posix()]
+        # Process-Profil härten + INFILL überschreiben
+        hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
-        logs: List[Dict[str, Any]] = []
+        # Settings-Chain
+        settings_chain = [hardened_process, pick_printer]
+        filament_chain = [pick_filament]
 
-        def try_run(cmd: List[str], tag: str):
-            code, out, err = run([XVFB, "-a"] + cmd, timeout=900)
-            logs.append({"tag": tag, "code": code, "stderr_tail": (err or out)[-300:]})
-            return code
+        base = [SLICER_BIN,
+                "--datadir", str(datadir),
+                "--info",
+                "--allow-newer-file", "1",
+                "--load-settings", ";".join(settings_chain),
+                "--load-filaments", ";".join(filament_chain),
+                "--export-slicedata", str(out_meta),
+                inp.as_posix()]
 
-        # Versuch 1: ohne --slice (nur Projekt exportieren, falls nötig)
-        tried_1 = False
-        if force_slice != "always":
-            tried_1 = True
-            cmd1 = base_cmd() + ["--export-3mf", str(out_3mf)]
-            c1 = try_run(cmd1, "no-slice")
-            meta1 = parse_slicedata_folder(out_meta) if c1 == 0 else {}
+        # IMMER slicen (Platte 0) und 3MF ablegen (für Debugging/Archiv)
+        cmd = base + ["--slice", "0", "--export-3mf", str(out_3mf)]
 
-            if meta1.get("duration_s"):
-                return {
-                    "ok": True,
-                    "input_ext": ".3mf" if is_3mf else ".stl",
-                    "duration_s": float(meta1["duration_s"]),
-                    "filament_mm": meta1.get("filament_mm"),
-                    "filament_g": meta1.get("filament_g"),
-                    "logs": logs,
-                    "notes": "Zeit aus Slicedata (ohne --slice)."
-                }
+        code, out, err = run([XVFB, "-a"] + cmd, timeout=900)
+        tail = (err or out)[-800:]
+        if code != 0:
+            raise HTTPException(500, detail=f"Slicing fehlgeschlagen (exit {code}): {tail}")
 
-        # Versuch 2: mit --slice 0
-        cmd2 = base_cmd() + ["--slice", "0", "--export-3mf", str(out_3mf)]
-        c2 = try_run(cmd2, "slice-0")
-        if c2 != 0:
-            raise HTTPException(500, detail=f"Orca-Run fehlgeschlagen (exit {c2}). Logs: {logs}")
-
-        meta2 = parse_slicedata_folder(out_meta)
-        if not meta2.get("duration_s"):
-            raise HTTPException(500, detail=f"Keine Druckzeit in Slicedata gefunden. Logs: {logs}")
+        meta = parse_slicedata_folder(out_meta)
+        if not meta.get("duration_s"):
+            raise HTTPException(500, detail=f"Keine Druckzeit in Slicedata gefunden. Logs: {tail}")
 
         return {
             "ok": True,
             "input_ext": ".3mf" if is_3mf else ".stl",
-            "duration_s": float(meta2["duration_s"]),
-            "filament_mm": meta2.get("filament_mm"),
-            "filament_g": meta2.get("filament_g"),
-            "logs": logs,
-            "notes": "Zeit aus Slicedata (--slice 0)."
+            "profiles_used": {
+                "printer": Path(pick_printer).name,
+                "process": Path(pick_process0).name,
+                "filament": Path(pick_filament).name
+            },
+            "material": material.upper(),
+            "infill_pct": infill_pct,
+            "duration_s": float(meta["duration_s"]),
+            "filament_mm": meta.get("filament_mm"),
+            "filament_g": meta.get("filament_g"),
+            "notes": "Gesliced mit festen Profilen (--slice 0), Filament & Infill aus Kundeneingabe."
         }
     finally:
-        # temporäre Dateien wegräumen
-        try:
-            shutil.rmtree(work, ignore_errors=True)
-        except Exception:
-            pass
-
-# --- Kostenabschätzung --------------------------------------------------------
-@app.post("/estimate_cost", response_class=JSONResponse)
-async def estimate_cost(payload: Dict[str, Any]):
-    """
-    JSON Body Felder:
-      duration_s (erforderlich)
-      material (PLA/PETG/ASA/PC) [optional, default PLA]
-      filament_g [optional] oder filament_mm [optional]  (wenn beides da, gewinnt filament_g)
-      machine_rate_eur_h [default 6.0]
-      material_eur_kg    [default 22.0]
-      energy_kwh_per_h   [default 0.1]
-      energy_eur_per_kwh [default 0.35]
-      setup_fee_eur      [default 0.0]
-      risk_pct           [default 0.0]
-    """
-    try:
-        duration_s = float(payload.get("duration_s", None))
-    except Exception:
-        raise HTTPException(400, "duration_s fehlt oder ist ungültig.")
-    if duration_s <= 0:
-        raise HTTPException(400, "duration_s muss > 0 sein.")
-
-    material = (payload.get("material") or "PLA").upper()
-    machine_rate = float(payload.get("machine_rate_eur_h", 6.0))
-    material_eur_kg = float(payload.get("material_eur_kg", 22.0))
-    energy_kwh_per_h = float(payload.get("energy_kwh_per_h", 0.10))
-    energy_eur_per_kwh = float(payload.get("energy_eur_per_kwh", 0.35))
-    setup_fee = float(payload.get("setup_fee_eur", 0.0))
-    risk_pct = clamp(float(payload.get("risk_pct", 0.0)), 0.0, 100.0)
-
-    filament_g = payload.get("filament_g", None)
-    filament_mm = payload.get("filament_mm", None)
-    try:
-        filament_g = None if filament_g is None else float(filament_g)
-        filament_mm = None if filament_mm is None else float(filament_mm)
-    except Exception:
-        raise HTTPException(400, "filament_g/filament_mm müssen numerisch sein.")
-
-    # ggf. von mm auf g umrechnen
-    if filament_g is None and filament_mm is not None:
-        filament_g = filament_mm_to_g(filament_mm, material=material)
-
-    hours = duration_s / 3600.0
-    machine_cost = hours * machine_rate
-    energy_cost = hours * energy_kwh_per_h * energy_eur_per_kwh
-    material_cost = ( (filament_g or 0.0) / 1000.0 ) * material_eur_kg
-
-    subtotal = machine_cost + energy_cost + material_cost + setup_fee
-    total = subtotal * (1.0 + risk_pct / 100.0)
-
-    return {
-        "ok": True,
-        "inputs": {
-            "duration_s": duration_s,
-            "material": material,
-            "filament_g": filament_g,
-            "filament_mm": filament_mm,
-            "machine_rate_eur_h": machine_rate,
-            "material_eur_kg": material_eur_kg,
-            "energy_kwh_per_h": energy_kwh_per_h,
-            "energy_eur_per_kwh": energy_eur_per_kwh,
-            "setup_fee_eur": setup_fee,
-            "risk_pct": risk_pct
-        },
-        "breakdown": {
-            "machine_cost_eur": round(machine_cost, 2),
-            "energy_cost_eur": round(energy_cost, 2),
-            "material_cost_eur": round(material_cost, 2),
-            "setup_fee_eur": round(setup_fee, 2),
-            "subtotal_eur": round(subtotal, 2),
-            "risk_added_eur": round(total - subtotal, 2),
-        },
-        "total_eur": round(total, 2)
-    }
+        try: shutil.rmtree(work, ignore_errors=True)
+        except Exception: pass
