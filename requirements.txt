@@ -1,10 +1,9 @@
 fastapi
 uvicorn[standard]
 trimesh
-numpy
+numpy==2.1.*         # stabil mit Py 3.11
+scipy==1.13.*        # stabil mit Py 3.11 (ggf. 1.14.* auch ok)
 pydantic
 python-multipart
-
-
 
 
