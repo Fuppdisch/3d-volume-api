@@ -113,32 +113,101 @@ def percent_from_frac(x: float) -> int:
     f = max(0.0, min(1.0, f))
     return int(round(f * 100))
 
+# --- Typ-Helper: schreibe Werte im gleichen Typ, wie er im Profil existiert ---
+def to_same_type(old_val, new_val):
+    """
+    Konvertiere new_val in den Typ von old_val (so gut es geht),
+    weil Orca-Profile häufig Strings für Zahlen/Booleans verwenden.
+    """
+    # Strings im Profil: schreibe als String
+    if isinstance(old_val, str):
+        if isinstance(new_val, bool):
+            return "1" if new_val else "0"
+        try:
+            if isinstance(new_val, (int, float)):
+                return str(int(new_val)) if float(new_val).is_integer() else str(float(new_val))
+        except Exception:
+            pass
+        return str(new_val)
+
+    if isinstance(old_val, bool):
+        return bool(new_val)
+
+    if isinstance(old_val, int):
+        try:
+            return int(round(float(new_val)))
+        except Exception:
+            return old_val
+
+    if isinstance(old_val, float):
+        try:
+            return float(new_val)
+        except Exception:
+            return old_val
+
+    return new_val
+
+def set_typed(obj: dict, key: str, desired, default_type="string"):
+    """
+    Setzt obj[key] auf desired, aber im Typ des existierenden Wertes.
+    Existiert key nicht, schreiben wir je nach default_type:
+      - "string": als String (robusteste Wahl)
+      - "number": als int/float
+      - "bool":   als "0"/"1" (String) oder echtes bool
+    """
+    if key in obj:
+        obj[key] = to_same_type(obj[key], desired)
+    else:
+        if default_type == "bool":
+            obj[key] = "1" if bool(desired) else "0"
+        elif default_type == "number":
+            try:
+                f = float(desired)
+                obj[key] = int(round(f)) if f.is_integer() else f
+            except Exception:
+                obj[key] = str(desired)
+        else:
+            obj[key] = str(desired)
+
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: Optional[int] = None) -> str:
     """
     Process-Profil minimal härten + optional Infill-Dichte (in %) überschreiben.
+    WICHTIG: Typen der Ziel-Keys so schreiben, wie sie im Profil vorhanden sind.
     """
     try:
         proc = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
-    def set_if_missing(obj, key, val):
-        if key not in obj or obj[key] in (None, "", -1):
-            obj[key] = val
+    # 1) Auf absolute E umstellen (use_relative_e_distances = false/0/"0")
+    if "use_relative_e_distances" in proc:
+        set_typed(proc, "use_relative_e_distances", False)
+    else:
+        set_typed(proc, "use_relative_e_distances", False, default_type="bool")
 
-    # Robustheit:
-    set_if_missing(proc, "use_relative_e_distances", False)  # absolute E
+    # 2) G92 E0 in layer_gcode sicherstellen (String-Feld)
     lg = (proc.get("layer_gcode") or "").strip()
     if "G92 E0" not in lg:
-        proc["layer_gcode"] = (lg + "\nG92 E0\n").strip()
+        lg = (lg + "\nG92 E0\n").strip()
+    proc["layer_gcode"] = lg
 
+    # 3) Negative Werte reparieren (typgerecht)
     for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
-        v = proc.get(k, None)
-        if isinstance(v, (int, float)) and v < 0:
-            proc[k] = 0
+        if k in proc:
+            v = proc[k]
+            try:
+                fv = float(v) if isinstance(v, str) else float(v)
+            except Exception:
+                set_typed(proc, k, 0)
+            else:
+                set_typed(proc, k, 0 if fv < 0 else fv)
 
+    # 4) Infill (fill_density) auf Prozent setzen – Typ wie im Profil
     if fill_density_pct is not None:
-        proc["fill_density"] = int(max(0, min(100, fill_density_pct)))
+        if "fill_density" in proc:
+            set_typed(proc, "fill_density", int(max(0, min(100, fill_density_pct))))
+        else:
+            proc["fill_density"] = str(int(max(0, min(100, fill_density_pct))))
 
     out = workdir / "process_hardened.json"
     save_json(out, proc)
@@ -350,6 +419,10 @@ function openDocs(){ window.open(base + '/docs', '_blank'); }
 </script>
 """
 
+@app.get("/", response_class=HTMLResponse)
+def root_index():
+    return index()
+
 @app.get("/health", response_class=JSONResponse)
 def health():
     return {
@@ -412,8 +485,8 @@ async def estimate_time(
     process_profile: str = Form(None),
     filament_profile: str = Form(None),
     material: str = Form("PLA"),  # PLA|PETG|ASA|PC
-    infill: float = Form(0.35),   # 0..1 (z. B. 0.35 = 35%)
-    debug: int = Form(0),         # <-- NEU: Debug-Ausgabe aktivieren
+    infill: float = Form(0.35),   # 0..1
+    debug: int = Form(0),         # 1 = Debug-Infos in Response
 ):
     if not slicer_exists():
         raise HTTPException(500, "OrcaSlicer CLI nicht verfügbar.")
@@ -439,6 +512,7 @@ async def estimate_time(
             raise HTTPException(500, "Kein Filament-Profil vorhanden. Bitte /app/profiles/filaments/*.json bereitstellen.")
         pick_filament = auto_fil
 
+    # Infill-Prozent 0..100
     infill_pct = percent_from_frac(infill)
     if infill_pct is None:
         raise HTTPException(400, "Ungültiger Infill-Wert. Erwartet 0..1, z. B. 0.35 für 35%.")
@@ -452,6 +526,7 @@ async def estimate_time(
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
+        # Process-Profil härten + Infill setzen (typgerecht)
         hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct)
 
         settings_chain = [hardened_process, pick_printer]
