@@ -21,7 +21,7 @@
     "brim_width": "5",
     "calib_flowrate_topinfill_special_order": "0",
     "compatible_printers": [
-        "Homepage RatRig RatRig V-Core 3 400 0.4"
+        "Homepage"
     ],
     "compatible_printers_condition": "",
     "counterbore_hole_bridging": "none",
