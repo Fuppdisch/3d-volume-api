@@ -122,13 +122,18 @@ def _collect_orca_result_json(base_dir: Path) -> dict | None:
     return None
 
 def _scrub_g92(txt: str) -> str:
-    """Remove G92 E0 lines to avoid conflicts with absolute E."""
+    """Remove G92 E0 lines."""
     if not txt:
         return txt
     return "\n".join(
         ln for ln in txt.splitlines()
         if "G92 E0" not in ln and "G92E0" not in ln
     )
+
+def _ensure_g92_per_layer(txt: str) -> str:
+    """Ensure G92 E0 appears at least once in the layer hook text."""
+    txt = txt or ""
+    return txt if ("G92 E0" in txt or "G92E0" in txt) else (txt + ("\n" if txt and not txt.endswith("\n") else "") + "G92 E0")
 
 def parse_infill(infill: Optional[str], infill_pct: Optional[str]) -> int:
     """
@@ -161,25 +166,38 @@ def parse_infill(infill: Optional[str], infill_pct: Optional[str]) -> int:
 # -----------------------------------------------------------------------------
 def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: int | None = None) -> str:
     """
-    Process preset: scrub G92 (if absolute E), clamp negative placeholders,
-    optionally override fill_density (percent).
+    Process preset: je nach E-Modus (rel./abs.) G92 setzen/entfernen,
+    negative Platzhalter neutralisieren, optional fill_density überschreiben.
     """
     try:
         proc = load_json(Path(src_path))
     except Exception as e:
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
-    # if absolute E, ensure no per-layer G92 resets are present
-    if proc.get("use_relative_e_distances") in (False, 0, "0", "false", "False"):
+    # RELATIVE E -> G92 E0 pro Layer SICHERSTELLEN
+    if proc.get("use_relative_e_distances") in (True, 1, "1", "true", "True"):
+        changed = False
+        for key in ("layer_gcode", "before_layer_gcode", "before_layer_change_gcode"):
+            if key in proc:
+                newtxt = _ensure_g92_per_layer(proc.get(key) or "")
+                if newtxt != proc.get(key, ""):
+                    proc[key] = newtxt
+                    changed = True
+        if not changed:
+            # Setze layer_gcode minimal, falls gar nichts vorhanden war
+            proc.setdefault("layer_gcode", "G92 E0")
+    else:
+        # ABSOLUTE E -> G92 E0 in layer hooks ENTFERNEN
         for key in ("layer_gcode", "before_layer_gcode", "before_layer_change_gcode", "toolchange_gcode", "printing_by_object_gcode"):
             if key in proc and proc[key]:
                 proc[key] = _scrub_g92(proc[key])
 
-    # neutralize known negative placeholders
+    # Problematische negative Defaults neutralisieren
     for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
         if isinstance(proc.get(k), (int, float)) and proc[k] < 0:
             proc[k] = 0
 
+    # Infill % überschreiben, falls angegeben
     if fill_density_pct is not None:
         proc["fill_density"] = int(max(0, min(100, fill_density_pct)))
 
@@ -189,7 +207,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: in
 
 def harden_filament_profile(src_path: str, workdir: Path, *, material: str) -> str:
     """
-    Filament preset: ensure 'type' is filament; allow light normalization if needed.
+    Filament preset: sicherstellen, dass "type" korrekt ist; sonst unverändert.
     """
     try:
         fil = load_json(Path(src_path))
@@ -197,7 +215,6 @@ def harden_filament_profile(src_path: str, workdir: Path, *, material: str) -> s
         raise HTTPException(500, f"Filament-Profil ungültig: {e}")
 
     fil.setdefault("type", "filament")
-    # keep file otherwise intact (we don't force-temp/flow etc. here)
 
     out = workdir / "filament_hardened.json"
     save_json(out, fil)
@@ -360,7 +377,7 @@ def index():
           <option>PLA</option><option>PETG</option><option>ASA</option><option>PC</option>
         </select>
         <label>Infill</label><input name="infill" type="text" value="0.35" style="width:120px">
-        <small>(0..1 mit Punkt) oder unten als Prozent</small>
+        <small>(0..1 mit Punkt) oder unten als Prozent)</small>
       </div>
       <div style="margin:8px 0">
         <label>Infill %</label><input name="infill_pct" type="text" placeholder="z.B. 35" style="width:120px">
@@ -429,7 +446,7 @@ def slicer_env():
     try:
         code, out, err = run_cmd([which, "--help"], timeout=8)
         info["return_code"] = code
-        info["help_snippet"] = (out or err or "")[:800]
+        info["help_snippet"] = (out or err or "")[:1000]
     except Exception as e:
         info["return_code"] = None
         info["help_snippet"] = f"(help not available) {e}"
@@ -526,7 +543,7 @@ async def estimate_time(
         hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct_val)
         hardened_filament = harden_filament_profile(pick_filament, work, material=material)
 
-        # Build args
+        # Build args (Try 1)
         base_args = [
             SLICER_BIN,
             "--debug", str(4 if debug else 0),
@@ -538,14 +555,12 @@ async def estimate_time(
             "--slice", "0",
             "--export-3mf", str(out_3mf),
         ]
-
-        # Try 1: as above
         last_cmd_list = [XVFB, "-a"] + base_args
         code, out, err = run_cmd(last_cmd_list, timeout=900)
         attempts.append({"tag": "try-1", "cmd": " ".join(last_cmd_list), "stderr_tail": (err or out)[-800:]})
 
+        # Try 2 (Reihenfolge-Variante)
         if code != 0:
-            # Try 2: move export-slicedata after inputs (manche Versionen zicken)
             base_args2 = [
                 SLICER_BIN,
                 "--debug", str(4 if debug else 0),
@@ -562,16 +577,17 @@ async def estimate_time(
             attempts.append({"tag": "try-2", "cmd": " ".join(last_cmd_list), "stderr_tail": (err2 or out2)[-800:]})
             code, out, err = code2, out2, err2
 
+        # Try 3 (synthetischer Minimal-Process; kompatibel zu allen Printern)
         if code != 0:
-            # Try 3: use synthetic process (minimal), still with your printer + filament
-            # Useful when process/printer compatibility blocks slicing
             proc_syn = {
                 "type": "process",
                 "name": "synthetic_min",
+                "version": 1,
+                "compatible_printers": ["*"],
                 "layer_height": 0.2,
-                "use_relative_e_distances": False,
                 "fill_density": int(infill_pct_val),
-                "compatible_printers": ["*"]
+                # Standard: absolute E; falls ihr RELATIVE E wollt, auf True setzen
+                "use_relative_e_distances": False,
             }
             syn_path = work / "process_synthetic.json"
             save_json(syn_path, proc_syn)
