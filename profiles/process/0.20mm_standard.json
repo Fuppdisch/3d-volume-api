@@ -54,7 +54,7 @@
     "bridge_flow": "0.85",
     "resolution": "0.0125",
     "elefant_foot_compensation": "0.1",
-	"use_relative_e_distances": false
+	"use_relative_e_distances": false,
     "compatible_printers": [
         "RatRig V-Core 4 300 0.4 nozzle",
         "RatRig V-Core 4 400 0.4 nozzle",
