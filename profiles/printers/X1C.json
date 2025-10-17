@@ -111,7 +111,7 @@
     "before_layer_change_gcode": ";BEFORE_LAYER_CHANGE\n;[layer_z]\nG92 E0\n_ON_LAYER_CHANGE LAYER={layer_num + 1}",
     "change_filament_gcode": "M600",
     "machine_pause_gcode": "PAUSE",
-    "printing_by_object_gcode": ";BETWEEN_OBJECTS\nG92 E0",
+    "printing_by_object_gcode": ";BETWEEN_OBJECTS", 
     "printable_height": "300",
     "thumbnails": [
         "64x64/PNG",
