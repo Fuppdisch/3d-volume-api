@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 # ---------- app.py ----------
 import os
 import io
@@ -10,36 +8,40 @@ import zipfile
 import shutil
 import tempfile
 import subprocess
+import traceback
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+
+import xml.etree.ElementTree as ET
+import numpy as np
+import trimesh
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-import xml.etree.ElementTree as ET
-import trimesh
-import numpy as np
-
-# -----------------------------------------------------------------------------
-# App & CORS
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   FastAPI Grundgerüst
+# =============================================================================
 app = FastAPI(title="3D Print – Fixed Profiles Slicing API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
-# Env / Binaries
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   Slicer / Umgebung
+# =============================================================================
 SLICER_BIN = (
     os.getenv("SLICER_BIN")
     or os.getenv("ORCASLICER_BIN")
     or os.getenv("PRUSASLICER_BIN")
     or "/usr/local/bin/orca-slicer"
 )
+
+# Headless-Defaults
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
 os.environ.setdefault(
@@ -54,28 +56,35 @@ os.environ.setdefault(
 XVFB = shutil.which("xvfb-run") or "xvfb-run"
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   Utilities
+# =============================================================================
 def sha256_of_bytes(buf: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(buf)
-    return h.hexdigest()
+    h = hashlib.sha256(); h.update(buf); return h.hexdigest()
 
 def slicer_exists() -> bool:
     return (os.path.isfile(SLICER_BIN) and os.access(SLICER_BIN, os.X_OK)) or \
            (shutil.which(os.path.basename(SLICER_BIN)) is not None)
 
-def run_cmd(cmd: List[str], timeout: int = 900) -> Tuple[int, str, str]:
-    """Run a command and return (code, stdout, stderr)."""
+def run(cmd: List[str], timeout: int = 900) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout or "", p.stderr or ""
 
 def np_to_list(x) -> List[float]:
     return list(map(float, x))
 
+def fraction_to_percent(frac: Optional[str|float|int]) -> Optional[int]:
+    if frac is None:
+        return None
+    try:
+        if isinstance(frac, str):
+            frac = frac.replace(",", ".")
+        f = float(frac)
+    except Exception:
+        return None
+    return int(round(max(0.0, min(1.0, f)) * 100))
+
 def find_profiles() -> Dict[str, List[str]]:
-    """Find profile files under /app/profiles."""
     base = Path("/app/profiles")
     res = {"printer": [], "process": [], "filament": []}
     for key, sub in [("printer","printers"), ("process","process"), ("filament","filaments")]:
@@ -85,26 +94,34 @@ def find_profiles() -> Dict[str, List[str]]:
     return res
 
 def must_pick(profile_paths: List[str], label: str, wanted_name: Optional[str]) -> str:
-    """Pick a profile path. If wanted_name provided, try to match by filename."""
     if wanted_name:
         for p in profile_paths:
             n = Path(p).name
-            if n == wanted_name or wanted_name.lower() in Path(p).name.lower():
+            if n == wanted_name or wanted_name in Path(p).stem:
                 return p
         raise HTTPException(400, f"{label}-Profil '{wanted_name}' nicht gefunden.")
     if not profile_paths:
-        raise HTTPException(500, f"Kein {label}-Profil vorhanden. Erwartet Dateien unter /app/profiles/{label}s/*.json.")
+        raise HTTPException(500, f"Kein {label}-Profil vorhanden. Bitte /app/profiles/{label}s/*.json bereitstellen.")
     return profile_paths[0]
 
-def pick_filament_for_material(filament_paths: List[str], material: str) -> Optional[str]:
-    """Pick filament preset whose filename contains material (PLA/PETG/ASA/PC)."""
-    if not filament_paths:
-        return None
-    m = (material or "").strip().upper()
-    for p in filament_paths:
-        if m in Path(p).name.upper():
-            return p
-    return filament_paths[0]
+# ---- Stringify / Harden Helpers ---------------------------------------------
+def _as_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return str(v)
+
+def _stringify_all(obj):
+    if isinstance(obj, dict):
+        return {k: _stringify_all(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_stringify_all(x) for x in obj]
+    if isinstance(obj, (int, float, bool)) or obj is None:
+        return _as_str(obj)
+    return obj
 
 def load_json(p: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
@@ -112,123 +129,78 @@ def load_json(p: Path) -> dict:
 def save_json(p: Path, obj: dict):
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
 
-def _collect_orca_result_json(base_dir: Path) -> dict | None:
-    """Search result.json recursively (Orca writes details there on failures)."""
-    for jf in base_dir.rglob("result.json"):
-        try:
-            return json.loads(jf.read_text()[:1_000_000])
-        except Exception:
-            pass
-    return None
+def harden_printer_profile(src_path: str, workdir: Path) -> tuple[str, dict]:
+    raw = load_json(Path(src_path))
+    j = _stringify_all(raw)
+    j["type"] = "machine"
+    j["from"] = "user"
+    if not j.get("name", "").strip():
+        j["name"] = "Custom Machine 0.4"
+    j.setdefault("version", "1")
+    j.setdefault("nozzle_diameter", ["0.4"])
+    out = workdir / "printer_hardened.json"
+    save_json(out, j)
+    return str(out), j
 
-def _scrub_g92(txt: str) -> str:
-    """Remove G92 E0 lines."""
-    if not txt:
-        return txt
-    return "\n".join(
-        ln for ln in txt.splitlines()
-        if "G92 E0" not in ln and "G92E0" not in ln
-    )
+def harden_process_profile(src_path: str, workdir: Path,
+                           *, fill_density_pct: Optional[int] = None,
+                           printer_name_for_compat: Optional[str] = None) -> tuple[str, dict]:
+    raw = load_json(Path(src_path))
+    j = _stringify_all(raw)
+    j["type"] = "process"
+    j["from"] = "user"
 
-def _ensure_g92_per_layer(txt: str) -> str:
-    """Ensure G92 E0 appears at least once in the layer hook text."""
-    txt = txt or ""
-    return txt if ("G92 E0" in txt or "G92E0" in txt) else (txt + ("\n" if txt and not txt.endswith("\n") else "") + "G92 E0")
+    # Absolute E + Hooks leeren (verhindert G92-Konflikte)
+    j["use_relative_e_distances"] = "0"
+    for hook in ("layer_gcode", "before_layer_gcode", "before_layer_change_gcode",
+                 "toolchange_gcode", "printing_by_object_gcode"):
+        if hook in j and isinstance(j[hook], str) and "G92" in j[hook]:
+            j[hook] = ""
+        j.setdefault(hook, "")
 
-def parse_infill(infill: Optional[str], infill_pct: Optional[str]) -> int:
-    """
-    Accept either 'infill' (0..1, "." or ",") or 'infill_pct' (0..100).
-    Returns percentage int 0..100.
-    """
-    if infill is not None and str(infill).strip() != "":
-        s = str(infill).strip().replace(",", ".")
-        try:
-            f = float(s)
-        except Exception as e:
-            raise HTTPException(400, f"Ungültiger Infill-Wert: {e}")
-        f = max(0.0, min(1.0, f))
-        return int(round(f * 100))
-
-    if infill_pct is not None and str(infill_pct).strip() != "":
-        s = str(infill_pct).strip().replace(",", ".")
-        try:
-            p = float(s)
-        except Exception as e:
-            raise HTTPException(400, f"Ungültiger Infill-Prozentwert: {e}")
-        p = max(0.0, min(100.0, p))
-        return int(round(p))
-
-    # default 35%
-    return 35
-
-# -----------------------------------------------------------------------------
-# Profile hardening (Process only; Printer stays original)
-# -----------------------------------------------------------------------------
-def harden_process_profile(src_path: str, workdir: Path, *, fill_density_pct: int | None = None) -> str:
-    """
-    Process preset: je nach E-Modus (rel./abs.) G92 setzen/entfernen,
-    negative Platzhalter neutralisieren, optional fill_density überschreiben.
-    """
-    try:
-        proc = load_json(Path(src_path))
-    except Exception as e:
-        raise HTTPException(500, f"Process-Profil ungültig: {e}")
-
-    # RELATIVE E -> G92 E0 pro Layer SICHERSTELLEN
-    if proc.get("use_relative_e_distances") in (True, 1, "1", "true", "True"):
-        changed = False
-        for key in ("layer_gcode", "before_layer_gcode", "before_layer_change_gcode"):
-            if key in proc:
-                newtxt = _ensure_g92_per_layer(proc.get(key) or "")
-                if newtxt != proc.get(key, ""):
-                    proc[key] = newtxt
-                    changed = True
-        if not changed:
-            # Setze layer_gcode minimal, falls gar nichts vorhanden war
-            proc.setdefault("layer_gcode", "G92 E0")
-    else:
-        # ABSOLUTE E -> G92 E0 in layer hooks ENTFERNEN
-        for key in ("layer_gcode", "before_layer_gcode", "before_layer_change_gcode", "toolchange_gcode", "printing_by_object_gcode"):
-            if key in proc and proc[key]:
-                proc[key] = _scrub_g92(proc[key])
-
-    # Problematische negative Defaults neutralisieren
-    for k in ("tree_support_wall_count", "raft_first_layer_expansion"):
-        if isinstance(proc.get(k), (int, float)) and proc[k] < 0:
-            proc[k] = 0
-
-    # Infill % überschreiben, falls angegeben
     if fill_density_pct is not None:
-        proc["fill_density"] = int(max(0, min(100, fill_density_pct)))
+        j["fill_density"] = _as_str(int(max(0, min(100, fill_density_pct))))
+    else:
+        j.setdefault("fill_density", "25")
+
+    if printer_name_for_compat:
+        cps = j.get("compatible_printers")
+        if not isinstance(cps, list):
+            cps = []
+        if printer_name_for_compat not in cps:
+            cps.append(printer_name_for_compat)
+        j["compatible_printers"] = cps
+
+    j.setdefault("version", "1")
+    j.setdefault("layer_height", "0.2")
+    j.setdefault("initial_layer_height", "0.3")
+    j.setdefault("line_width", "0.45")
 
     out = workdir / "process_hardened.json"
-    save_json(out, proc)
-    return str(out)
+    save_json(out, j)
+    return str(out), j
 
-def harden_filament_profile(src_path: str, workdir: Path, *, material: str) -> str:
-    """
-    Filament preset: sicherstellen, dass "type" korrekt ist; sonst unverändert.
-    """
-    try:
-        fil = load_json(Path(src_path))
-    except Exception as e:
-        raise HTTPException(500, f"Filament-Profil ungültig: {e}")
-
-    fil.setdefault("type", "filament")
-
+def harden_filament_profile(src_path: str, workdir: Path,
+                            *, material_override: Optional[str] = None) -> tuple[str, dict]:
+    raw = load_json(Path(src_path))
+    j = _stringify_all(raw)
+    j.setdefault("type", "filament")
+    j["from"] = "user"
+    if material_override:
+        j["name"] = f"{material_override.upper()} (hardened)"
     out = workdir / "filament_hardened.json"
-    save_json(out, fil)
-    return str(out)
+    save_json(out, j)
+    return str(out), j
 
-# -----------------------------------------------------------------------------
-# Analyze (STL/3MF)
-# -----------------------------------------------------------------------------
-def analyze_stl(data: bytes) -> Dict[str, Any]:
+# =============================================================================
+#   Analyse (STL / 3MF)
+# =============================================================================
+def analyze_stl_safe(data: bytes) -> Dict[str, Any]:
     mesh = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh")
     if isinstance(mesh, trimesh.Scene):
-        mesh = trimesh.util.concatenate(tuple(
-            g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)
-        ))
+        parts = [g for g in mesh.geometry.values() if isinstance(g, trimesh.Trimesh)]
+        if parts:
+            mesh = trimesh.util.concatenate(tuple(parts))
     if not isinstance(mesh, trimesh.Trimesh) or mesh.is_empty:
         raise ValueError("STL enthält keine gültige Geometrie.")
 
@@ -236,8 +208,15 @@ def analyze_stl(data: bytes) -> Dict[str, Any]:
     mesh.process(validate=True)
 
     tri_count = int(mesh.faces.shape[0])
-    volume_mm3 = float(abs(mesh.volume)) if mesh.is_volume else None
-    area_mm2 = float(mesh.area) if mesh.area is not None else None
+    area_mm2 = float(mesh.area) if getattr(mesh, "area", None) is not None else None
+
+    # Volumen nur, wenn SciPy vorhanden ist – sonst None
+    volume_mm3 = None
+    try:
+        volume_mm3 = float(abs(mesh.volume)) if mesh.is_volume else None
+    except Exception:
+        volume_mm3 = None
+
     bounds = mesh.bounds
     size = bounds[1] - bounds[0]
 
@@ -256,14 +235,11 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         namelist = zf.namelist()
         model_xml_name = next((c for c in ("3D/3dmodel.model", "3d/3dmodel.model", "3D/Model.model") if c in namelist), None)
-
         res: Dict[str, Any] = {
             "zip_entries": len(namelist),
             "has_model_xml": bool(model_xml_name),
-            "objects": [],
-            "units": None,
-            "triangles_total": 0,
-            "objects_count": 0
+            "objects": [], "units": None,
+            "triangles_total": 0, "objects_count": 0
         }
         if not model_xml_name:
             return res
@@ -276,7 +252,7 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
 
         ns = {"m": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
         units = root.attrib.get("unit") or root.attrib.get("units")
-        res["units"] = units or "mm"
+        res["units"] = units or "millimeter"
 
         objects = root.findall(".//m:object", ns) if ns else root.findall(".//object")
         res["objects_count"] = len(objects)
@@ -287,7 +263,6 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
             mesh_elem = obj.find("m:mesh", ns) if ns else obj.find("mesh")
             if mesh_elem is None:
                 out_objects.append({"id": oid, "type": typ, "triangles": 0}); continue
-
             tris = mesh_elem.find("m:triangles", ns) if ns else mesh_elem.find("triangles")
             tri_count = len(tris.findall("m:triangle", ns) if ns else tris.findall("triangle")) if tris is not None else 0
             tri_total += tri_count
@@ -295,8 +270,8 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
             bbox = None
             verts_elem = mesh_elem.find("m:vertices", ns) if ns else mesh_elem.find("vertices")
             if verts_elem is not None:
-                vs = (verts_elem.findall("m:vertex", ns) if ns else verts_elem.findall("vertex"))
                 coords = []
+                vs = (verts_elem.findall("m:vertex", ns) if ns else verts_elem.findall("vertex"))
                 for v in vs:
                     try:
                         x = float(v.attrib.get("x", "0")); y = float(v.attrib.get("y", "0")); z = float(v.attrib.get("z", "0"))
@@ -307,7 +282,6 @@ def analyze_3mf(data: bytes) -> Dict[str, Any]:
                     arr = np.array(coords, dtype=float)
                     vmin = arr.min(axis=0); vmax = arr.max(axis=0)
                     bbox = {"bbox_min": np_to_list(vmin), "bbox_max": np_to_list(vmax), "bbox_size": np_to_list(vmax - vmin)}
-
             out_objects.append({"id": oid, "type": typ, "triangles": tri_count, **({"bbox": bbox} if bbox else {})})
 
         res["triangles_total"] = tri_total
@@ -327,9 +301,9 @@ def parse_slicedata_folder(folder: Path) -> Dict[str, Any]:
             pass
     return out
 
-# -----------------------------------------------------------------------------
-# UI / Health / Env
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   UI / Health / Env
+# =============================================================================
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -376,11 +350,7 @@ def index():
         <select name="material">
           <option>PLA</option><option>PETG</option><option>ASA</option><option>PC</option>
         </select>
-        <label>Infill</label><input name="infill" type="text" value="0.35" style="width:120px">
-        <small>(0..1 mit Punkt) oder unten als Prozent)</small>
-      </div>
-      <div style="margin:8px 0">
-        <label>Infill %</label><input name="infill_pct" type="text" placeholder="z.B. 35" style="width:120px">
+        <label>Infill (0..1)</label><input name="infill" type="text" value="0.35" style="width:120px">
       </div>
       <div style="margin:8px 0">
         <label>Printer-Profil</label><input name="printer_profile" placeholder="optional: Dateiname">
@@ -444,17 +414,17 @@ def slicer_env():
     which = shutil.which(os.path.basename(SLICER_BIN)) or SLICER_BIN
     info = {"ok": True, "bin_exists": slicer_exists(), "which": which}
     try:
-        code, out, err = run_cmd([which, "--help"], timeout=8)
+        code, out, err = run([which, "--help"], timeout=10)
         info["return_code"] = code
-        info["help_snippet"] = (out or err or "")[:1000]
+        info["help_snippet"] = (out or err or "")[:800]
     except Exception as e:
         info["return_code"] = None
         info["help_snippet"] = f"(help not available) {e}"
     return info
 
-# -----------------------------------------------------------------------------
-# Upload Analyse
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   Upload Analyse
+# =============================================================================
 @app.post("/analyze_upload", response_class=JSONResponse)
 async def analyze_upload(file: UploadFile = File(...)):
     filename = (file.filename or "").lower()
@@ -478,7 +448,7 @@ async def analyze_upload(file: UploadFile = File(...)):
 
     try:
         if filename.endswith(".stl"):
-            stl_meta = analyze_stl(data)
+            stl_meta = analyze_stl_safe(data)
             return {**base_meta, "stl": stl_meta}
         else:
             info = analyze_3mf(data)
@@ -486,19 +456,19 @@ async def analyze_upload(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(500, f"Analyse fehlgeschlagen: {e}")
 
-# -----------------------------------------------------------------------------
-# Slicing / Estimate Time
-# -----------------------------------------------------------------------------
+# =============================================================================
+#   Slicing / estimate_time
+# =============================================================================
 @app.post("/estimate_time", response_class=JSONResponse)
 async def estimate_time(
     file: UploadFile = File(...),
-    printer_profile: str = Form(None),
-    process_profile: str = Form(None),
-    filament_profile: str = Form(None),
-    material: str = Form("PLA"),        # PLA|PETG|ASA|PC
-    infill: str = Form(None),           # 0..1 (e.g. "0.35")
-    infill_pct: str = Form(None),       # 0..100 (e.g. "35")
-    debug: int = Form(0),
+    printer_profile: Optional[str] = Form(None),
+    process_profile: Optional[str] = Form(None),
+    filament_profile: Optional[str] = Form(None),
+    material: str = Form("PLA"),   # PLA|PETG|ASA|PC
+    infill: Optional[str] = Form(None),  # 0..1 (z. B. "0.35")
+    infill_pct: Optional[str] = Form(None), # 0..100 (als String erlaubt)
+    debug: Optional[int] = Form(0),
 ):
     if not slicer_exists():
         raise HTTPException(500, "OrcaSlicer CLI nicht verfügbar.")
@@ -512,125 +482,135 @@ async def estimate_time(
     if len(data) > MAX_FILE_BYTES:
         raise HTTPException(413, f"Datei > {MAX_FILE_BYTES // (1024*1024)} MB.")
 
-    # Profiles
+    # Infill normalisieren
+    pct_from_frac = fraction_to_percent(infill) if infill is not None else None
+    pct_direct = None
+    if infill_pct is not None:
+        try:
+            pct_direct = int(str(infill_pct).replace(",", "."))
+        except Exception:
+            raise HTTPException(400, f"Ungültiges infill_pct: {infill_pct}")
+    infill_final = pct_from_frac if pct_from_frac is not None else pct_direct
+    if infill_final is None:
+        infill_final = 35  # Fallback 35%
+
+    # Profile suchen / auswählen
     prof = find_profiles()
-    pick_printer  = must_pick(prof["printer"],  "printer",  printer_profile)
+    pick_printer = must_pick(prof["printer"],  "printer",  printer_profile)
     pick_process0 = must_pick(prof["process"],  "process",  process_profile)
-
     if filament_profile:
-        pick_filament = must_pick(prof["filament"], "filament", filament_profile)
+        pick_filament0 = must_pick(prof["filament"], "filament", filament_profile)
     else:
-        auto_fil = pick_filament_for_material(prof["filament"], material)
-        if not auto_fil:
-            raise HTTPException(500, "Kein Filament-Profil vorhanden. Bitte /app/profiles/filaments/*.json bereitstellen.")
-        pick_filament = auto_fil
-
-    # Infill → percent
-    infill_pct_val = parse_infill(infill, infill_pct)
+        # Auto: erst PLA gesucht, sonst erstes nehmen
+        auto = [p for p in prof["filament"] if "PLA" in Path(p).name.upper()]
+        pick_filament0 = auto[0] if auto else must_pick(prof["filament"], "filament", None)
 
     work = Path(tempfile.mkdtemp(prefix="fixedp_"))
-    attempts: List[Dict[str, Any]] = []
-    last_cmd_list: Optional[List[str]] = None
     try:
+        # Eingabe ablegen
         is_3mf = filename.endswith(".3mf")
         inp = work / ("input.3mf" if is_3mf else "input.stl")
         inp.write_bytes(data)
+
         out_meta = work / "slicedata"; out_meta.mkdir(parents=True, exist_ok=True)
         out_3mf  = work / "out.3mf"
         datadir  = work / "cfg"; datadir.mkdir(parents=True, exist_ok=True)
 
-        # Harden only process + filament. Printer stays as-is to avoid format issues.
-        hardened_process = harden_process_profile(pick_process0, work, fill_density_pct=infill_pct_val)
-        hardened_filament = harden_filament_profile(pick_filament, work, material=material)
+        # Harden: Printer -> Process -> Filament
+        printer_hardened, printer_json = harden_printer_profile(pick_printer, work)
+        process_hardened, process_json = harden_process_profile(
+            pick_process0, work,
+            fill_density_pct=infill_final,
+            printer_name_for_compat=printer_json.get("name")
+        )
+        filament_hardened, filament_json = harden_filament_profile(
+            pick_filament0, work, material_override=material
+        )
 
-        # Build args (Try 1)
-        base_args = [
+        # CLI – REIHENFOLGE: PRINTER vor PROCESS
+        base = [
             SLICER_BIN,
             "--debug", str(4 if debug else 0),
             "--datadir", str(datadir),
-            "--load-settings", ";".join([hardened_process, pick_printer]),
-            "--load-filaments", hardened_filament,
+            "--load-settings", f"{printer_hardened};{process_hardened}",
+            "--load-filaments", filament_hardened,
             "--export-slicedata", str(out_meta),
             inp.as_posix(),
             "--slice", "0",
             "--export-3mf", str(out_3mf),
         ]
-        last_cmd_list = [XVFB, "-a"] + base_args
-        code, out, err = run_cmd(last_cmd_list, timeout=900)
-        attempts.append({"tag": "try-1", "cmd": " ".join(last_cmd_list), "stderr_tail": (err or out)[-800:]})
 
-        # Try 2 (Reihenfolge-Variante)
+        attempts = []
+        # Versuch 1: wie oben
+        cmd1 = [XVFB, "-a"] + base
+        code, out, err = run(cmd1, timeout=900)
+        attempts.append({"tag": "try-1", "cmd": " ".join(cmd1), "stderr_tail": (err or out)[-800:]})
+
+        # Versuch 2: Alternativ-Reihenfolge der Export-Flags
         if code != 0:
-            base_args2 = [
-                SLICER_BIN,
-                "--debug", str(4 if debug else 0),
+            cmd2 = [XVFB, "-a"] + [
+                SLICER_BIN, "--debug", str(4 if debug else 0),
                 "--datadir", str(datadir),
-                "--load-settings", ";".join([hardened_process, pick_printer]),
-                "--load-filaments", hardened_filament,
+                "--load-settings", f"{printer_hardened};{process_hardened}",
+                "--load-filaments", filament_hardened,
                 inp.as_posix(),
                 "--slice", "0",
                 "--export-3mf", str(out_3mf),
-                "--export-slicedata", str(out_meta),
+                "--export-slicedata", str(out_meta)
             ]
-            last_cmd_list = [XVFB, "-a"] + base_args2
-            code2, out2, err2 = run_cmd(last_cmd_list, timeout=900)
-            attempts.append({"tag": "try-2", "cmd": " ".join(last_cmd_list), "stderr_tail": (err2 or out2)[-800:]})
-            code, out, err = code2, out2, err2
+            code, out, err = run(cmd2, timeout=900)
+            attempts.append({"tag": "try-2", "cmd": " ".join(cmd2), "stderr_tail": (err or out)[-800:]})
 
-        # Try 3 (synthetischer Minimal-Process; kompatibel zu allen Printern)
+        # Versuch 3: Minimal-Process (synthetisch), falls „Process inkompatibel/unsupported“
         if code != 0:
-            proc_syn = {
-                "type": "process",
-                "name": "synthetic_min",
-                "version": 1,
-                "compatible_printers": ["*"],
-                "layer_height": 0.2,
-                "fill_density": int(infill_pct_val),
-                # Standard: absolute E; falls ihr RELATIVE E wollt, auf True setzen
-                "use_relative_e_distances": False,
+            synth = {
+                "type": "process", "from": "user", "version": "1",
+                "name": "synthetic_0.2",
+                "use_relative_e_distances": "0",
+                "layer_height": "0.2", "initial_layer_height": "0.3",
+                "fill_density": str(int(max(0, min(100, infill_final)))),
+                "line_width": "0.45",
+                "compatible_printers": [printer_json.get("name", "Custom Machine 0.4")],
+                "layer_gcode": "", "before_layer_gcode": "", "before_layer_change_gcode": "",
+                "toolchange_gcode": "", "printing_by_object_gcode": ""
             }
-            syn_path = work / "process_synthetic.json"
-            save_json(syn_path, proc_syn)
+            synth = _stringify_all(synth)
+            process_synth = work / "process_synthetic.json"
+            save_json(process_synth, synth)
 
-            base_args3 = [
-                SLICER_BIN,
-                "--debug", str(4 if debug else 0),
+            cmd3 = [XVFB, "-a"] + [
+                SLICER_BIN, "--debug", str(4 if debug else 0),
                 "--datadir", str(datadir),
-                "--load-settings", ";".join([str(syn_path), pick_printer]),
-                "--load-filaments", hardened_filament,
+                "--load-settings", f"{process_synth};{printer_hardened}",  # (auch diese Reihenfolge mal testen)
+                "--load-filaments", filament_hardened,
                 "--export-slicedata", str(out_meta),
                 inp.as_posix(),
                 "--slice", "0",
                 "--export-3mf", str(out_3mf),
             ]
-            last_cmd_list = [XVFB, "-a"] + base_args3
-            code3, out3, err3 = run_cmd(last_cmd_list, timeout=900)
-            attempts.append({"tag": "try-3", "cmd": " ".join(last_cmd_list), "stderr_tail": (err3 or out3)[-800:]})
-            code, out, err = code3, out3, err3
+            code, out, err = run(cmd3, timeout=900)
+            attempts.append({"tag": "try-3", "cmd": " ".join(cmd3), "stderr_tail": (err or out)[-800:]})
 
         if code != 0:
-            err_payload = {
-                "message": "Slicing fehlgeschlagen (alle Strategien).",
-                "last_cmd": " ".join(last_cmd_list) if last_cmd_list else None,
-                "attempts": attempts
-            }
-            orca_result = _collect_orca_result_json(work)
-            if orca_result:
-                err_payload["orca_result_json"] = orca_result
-            raise HTTPException(status_code=500, detail=err_payload)
+            raise HTTPException(
+                500,
+                detail={
+                    "message": "Slicing fehlgeschlagen (alle Strategien).",
+                    "last_cmd": " ".join(attempts[-1]["cmd"].split()) if attempts else None,
+                    "attempts": attempts
+                }
+            )
 
-        # success → read slicedata
+        # Auswertung
         meta = parse_slicedata_folder(out_meta)
         if not meta.get("duration_s"):
-            err_payload = {
-                "message": "Keine Druckzeit in Slicedata gefunden.",
-                "last_cmd": " ".join(last_cmd_list) if last_cmd_list else None,
-                "attempts": attempts
-            }
-            orca_result = _collect_orca_result_json(work)
-            if orca_result:
-                err_payload["orca_result_json"] = orca_result
-            raise HTTPException(status_code=500, detail=err_payload)
+            raise HTTPException(
+                500,
+                detail={
+                    "message":"Keine Druckzeit in Slicedata gefunden.",
+                    "last_cmd":" ".join(base)
+                }
+            )
 
         return {
             "ok": True,
@@ -638,17 +618,26 @@ async def estimate_time(
             "profiles_used": {
                 "printer": Path(pick_printer).name,
                 "process": Path(pick_process0).name,
-                "filament": Path(pick_filament).name
+                "filament": Path(pick_filament0).name
             },
-            "material": (material or "").upper(),
-            "infill_pct": int(infill_pct_val),
+            "material": material.upper(),
+            "infill_pct": int(max(0, min(100, infill_final))),
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0)."
+            "notes": "Gesliced mit festen Profilen (--slice 0). Reihenfolge: Printer -> Process -> Filament."
         }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            500,
+            detail={
+                "message": str(e),
+                "traceback": traceback.format_exc()[-2000:]
+            }
+        )
     finally:
-        try:
-            shutil.rmtree(work, ignore_errors=True)
-        except Exception:
-            pass
+        try: shutil.rmtree(work, ignore_errors=True)
+        except Exception: pass
