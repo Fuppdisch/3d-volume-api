@@ -113,8 +113,5 @@
     "machine_pause_gcode": "",
     "printing_by_object_gcode": "", 
     "printable_height": "300",
-    "thumbnails": [
-        "64x64/PNG",
-        "400x300/PNG"
-    ]
+    "thumbnails": []
 }
