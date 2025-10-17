@@ -1,5 +1,5 @@
 {
-  "type": "printer",
+  "type": "machine",
   "version": "1",
   "name": "RatRig V-Core 4 400 0.4 nozzle",
   "inherits": "fdm_klipper_common",
