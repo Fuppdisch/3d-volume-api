@@ -2,21 +2,14 @@
   "type": "machine",
   "version": "1",
   "name": "RatRig V-Core 4 400 0.4 nozzle",
-  "inherits": "fdm_klipper_common",
-  "from": "system",
-  "setting_id": "GM002",
-  "instantiation": "true",
+
   "printer_model": "RatRig V-Core 4 400",
   "printer_variant": "0.4",
 
   "nozzle_diameter": ["0.4"],
 
-  "printable_area": [
-    "0x0",
-    "400x0",
-    "400x400",
-    "0x400"
-  ],
+  "printable_area": ["0x0", "400x0", "400x400", "0x400"],
+  "printable_height": "300",
 
   "machine_max_speed_x": ["400", "400"],
   "machine_max_speed_y": ["400", "400"],
@@ -41,15 +34,5 @@
 
   "extruder_clearance_radius": "45",
   "extruder_clearance_height_to_rod": "25",
-  "extruder_clearance_height_to_lid": "140",
-
-  "retract_lift_below": ["0.2"],
-  "retraction_length": ["0.8"],
-  "retraction_speed": ["120"],
-  "deretraction_speed": ["120"],
-  "wipe": ["1"],
-  "retract_before_wipe": ["70%"],
-  "z_hop": ["0.2"],
-
-  "printable_height": "300"
+  "extruder_clearance_height_to_lid": "140"
 }
