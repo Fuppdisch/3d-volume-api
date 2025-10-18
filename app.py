@@ -197,7 +197,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
 
 def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     """
-    Filament-Profil minimal normalisieren (type=filament).
+    Filament-Profil minimal normalisieren und Kompatibilität maximal öffnen (inkl. "*").
     """
     try:
         f = load_json(Path(src_path))
@@ -206,6 +206,13 @@ def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     f["type"] = "filament"
     if "version" in f and not isinstance(f["version"], str):
         f["version"] = str(f["version"])
+
+    compat = f.get("compatible_printers")
+    if not isinstance(compat, list):
+        compat = []
+    compat = list({x for x in compat if isinstance(x, str)} | {"*"})
+    f["compatible_printers"] = compat
+
     out = workdir / "filament_hardened.json"
     save_json(out, f)
     return str(out), f
@@ -535,12 +542,12 @@ async def estimate_time(
             "name": "synthetic_infill_only",
             "sparse_infill_density": f"{pct}%",
             "before_layer_gcode": "",
-            "compatible_printers": [printer_name, printer_name.split(" (")[0].strip(), "*"]
+            "compatible_printers": list({printer_name, printer_name.split(" (")[0].strip(), "*"})
         }
         synth_path = work / "process_synthetic.json"
         save_json(synth_path, process_synth)
 
-        # ---------- CLI-Kommandos (getrennte --load-settings) ----------
+        # ---------- CLI-Kommandos (getrennte --load-settings, --slice ohne Argument) ----------
         def base_cmd(load_proc: str) -> List[str]:
             return [
                 SLICER_BIN,
@@ -551,7 +558,7 @@ async def estimate_time(
                 "--load-filaments", str(hardened_filament),
                 "--export-slicedata", str(out_meta),
                 inp.as_posix(),
-                "--slice", "0",
+                "--slice",                 # ← kein "0"
                 "--export-3mf", str(out_3mf),
             ]
 
@@ -572,7 +579,7 @@ async def estimate_time(
                 "--load-settings", str(hardened_process),
                 "--load-filaments", str(hardened_filament),
                 inp.as_posix(),
-                "--slice", "0",
+                "--slice",              # ← ohne Argument
                 "--export-3mf", str(out_3mf),
                 "--export-slicedata", str(out_meta),
             ]
@@ -624,7 +631,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0). Kompatibilität erzwungen; getrennte --load-settings."
+            "notes": "Gesliced mit festen Profilen (--slice). Kompatibilität erzwungen; getrennte --load-settings."
         }
     finally:
         try:
