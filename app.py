@@ -24,6 +24,7 @@ import numpy as np
 # ------------------------------------------------------------------------------
 app = FastAPI(title="3D Print – Fixed Profiles Slicing API")
 
+# ⚠️ CORS aktuell offen – später auf deine Domain(s) beschränken
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -121,8 +122,7 @@ def parse_infill_to_pct(infill_str_or_float: Any) -> int:
         v = float(s)
     except Exception:
         raise HTTPException(400, f"Ungültiger Infill-Wert: {infill_str_or_float!r}")
-    # Wenn > 1, interpretieren als Prozent
-    if v <= 1.0:
+    if v <= 1.0:  # 0..1 → Prozent
         v = v * 100.0
     v = max(0.0, min(100.0, v))
     return int(round(v))
@@ -132,8 +132,7 @@ def parse_infill_to_pct(infill_str_or_float: Any) -> int:
 # ------------------------------------------------------------------------------
 def harden_printer_profile(src_path: str, workdir: Path) -> Tuple[str, dict, str]:
     """
-    Normalisiert das Printer-Profil minimal und liefert auch den 'name' zurück,
-    damit wir den Process kompatibel machen können.
+    Normalisiert das Printer-Profil minimal und liefert auch den 'name' zurück.
     """
     try:
         j = load_json(Path(src_path))
@@ -142,7 +141,7 @@ def harden_printer_profile(src_path: str, workdir: Path) -> Tuple[str, dict, str
 
     j["type"] = "machine"
 
-    # ✅ WICHTIG: Orca erwartet STRINGS in nozzle_diameter
+    # ✅ Orca erwartet STRINGS in nozzle_diameter
     nd = j.get("nozzle_diameter")
     if isinstance(nd, list):
         j["nozzle_diameter"] = [str(x) for x in nd]
@@ -163,11 +162,10 @@ def harden_printer_profile(src_path: str, workdir: Path) -> Tuple[str, dict, str
 def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, printer_name: str) -> Tuple[str, dict]:
     """
     Process-Profil härten:
-      - type=process
-      - version als String
-      - Infill einheitlich als sparse_infill_density: "NN%"
-      - G92 E0 aus before_layer_gcode entfernen (verträgt sich nicht mit absolutem E)
-      - compatible_printers auf den tatsächlich verwendeten Printer setzen
+      - type=process, version als String
+      - Infill als sparse_infill_density: "NN%"
+      - G92 E0 aus before_layer_gcode entfernen
+      - compatible_printers maximal öffnen (inkl. "*")
     """
     try:
         p = load_json(Path(src_path))
@@ -180,20 +178,18 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
     else:
         p.setdefault("version", "1")
 
-    # Einheitliches Infill als Prozent-String:
     p.pop("fill_density", None)
     p["sparse_infill_density"] = f"{int(max(0, min(100, infill_pct)))}%"
 
-    # Layer-Change-GCode härten
     blg = (p.get("before_layer_gcode") or "")
     p["before_layer_gcode"] = blg.replace("G92 E0", "")
 
-    # Kompatibilität sicherstellen
-    cp = p.get("compatible_printers")
-    if not isinstance(cp, list):
-        cp = []
     base_name = printer_name.split(" (")[0].strip()
-    p["compatible_printers"] = list({printer_name, base_name})
+    compat = p.get("compatible_printers")
+    if not isinstance(compat, list):
+        compat = []
+    compat = list({*(x for x in compat if isinstance(x, str)), printer_name, base_name, "*"})
+    p["compatible_printers"] = compat
 
     out = workdir / "process_hardened.json"
     save_json(out, p)
@@ -208,7 +204,6 @@ def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     except Exception as e:
         raise HTTPException(500, f"Filament-Profil ungültig: {e}")
     f["type"] = "filament"
-    # version optional auf String
     if "version" in f and not isinstance(f["version"], str):
         f["version"] = str(f["version"])
     out = workdir / "filament_hardened.json"
@@ -487,7 +482,7 @@ async def estimate_time(
     process_profile: str = Form(None),
     filament_profile: str = Form(None),
     material: str = Form("PLA"),  # PLA|PETG|ASA|PC
-    infill: str = Form("0.35"),   # "0.35" (35%) oder "35" oder "35%"
+    infill: str = Form("0.35"),   # "0.35" (35) oder "35" oder "35%"
     debug: int = Form(0),
 ):
     if not slicer_exists():
@@ -532,7 +527,7 @@ async def estimate_time(
         hardened_process, process_json = harden_process_profile(pick_process0, work, infill_pct=pct, printer_name=printer_name)
         hardened_filament, _ = harden_filament_profile(pick_filament, work)
 
-        # ✅ Synthetic-Fallback-Process (Strings!)
+        # Synthetic-Fallback-Process (Strings, kompatibel)
         process_synth = {
             "type": "process",
             "version": "1",
@@ -540,18 +535,20 @@ async def estimate_time(
             "name": "synthetic_infill_only",
             "sparse_infill_density": f"{pct}%",
             "before_layer_gcode": "",
-            "compatible_printers": [printer_name]
+            "compatible_printers": [printer_name, printer_name.split(" (")[0].strip(), "*"]
         }
         synth_path = work / "process_synthetic.json"
         save_json(synth_path, process_synth)
 
+        # ---------- CLI-Kommandos (getrennte --load-settings) ----------
         def base_cmd(load_proc: str) -> List[str]:
             return [
                 SLICER_BIN,
                 "--debug", str(int(debug) if isinstance(debug, int) else 0),
                 "--datadir", str(datadir),
-                "--load-settings", ";".join([hardened_printer, load_proc]),
-                "--load-filaments", hardened_filament,
+                "--load-settings", str(hardened_printer),
+                "--load-settings", str(load_proc),
+                "--load-filaments", str(hardened_filament),
                 "--export-slicedata", str(out_meta),
                 inp.as_posix(),
                 "--slice", "0",
@@ -564,14 +561,16 @@ async def estimate_time(
         cmd1 = [XVFB, "-a"] + base_cmd(hardened_process)
         code, out, err = run(cmd1, timeout=900)
         attempts.append({"tag": "try-1", "cmd": " ".join(cmd1), "stderr_tail": (err or out)[-800:]})
+
+        # Versuch 2: export-slicedata ans Ende
         if code != 0:
-            # Versuch 2: gleiche Args aber export-slicedata ans Ende (Workaround für "No such file: 1")
             cmd2 = [XVFB, "-a"] + [
                 SLICER_BIN,
                 "--debug", str(int(debug) if isinstance(debug, int) else 0),
                 "--datadir", str(datadir),
-                "--load-settings", ";".join([hardened_printer, hardened_process]),
-                "--load-filaments", hardened_filament,
+                "--load-settings", str(hardened_printer),
+                "--load-settings", str(hardened_process),
+                "--load-filaments", str(hardened_filament),
                 inp.as_posix(),
                 "--slice", "0",
                 "--export-3mf", str(out_3mf),
@@ -589,14 +588,24 @@ async def estimate_time(
             code, out, err = code3, out3, err3
 
         if code != 0:
-            raise HTTPException(
-                500,
-                detail={
-                    "message": "Slicing fehlgeschlagen (alle Strategien).",
-                    "last_cmd": " ".join(attempts[-1]["cmd"].split()) if attempts else None,
-                    "attempts": attempts
-                }
-            )
+            # gehärtete JSONs anhängen (gekürzt) → schnelle Diagnose
+            def tail(p: Path, n=1200):
+                try:
+                    s = p.read_text(encoding="utf-8")
+                    return s[:n]
+                except Exception:
+                    return None
+
+            diag = {
+                "message": "Slicing fehlgeschlagen (alle Strategien).",
+                "last_cmd": " ".join(attempts[-1]["cmd"].split()) if attempts else None,
+                "attempts": attempts,
+                "printer_hardened_json": tail(Path(hardened_printer)),
+                "process_hardened_json": tail(Path(hardened_process)),
+                "filament_hardened_json": tail(Path(hardened_filament)),
+                "synthetic_process_json": tail(Path(synth_path)),
+            }
+            raise HTTPException(500, detail=diag)
 
         meta = parse_slicedata_folder(out_meta)
         if not meta.get("duration_s"):
@@ -615,7 +624,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 0). Kompatibilität erzwungen; robust gegen G92 E0."
+            "notes": "Gesliced mit festen Profilen (--slice 0). Kompatibilität erzwungen; getrennte --load-settings."
         }
     finally:
         try:
