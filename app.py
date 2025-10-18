@@ -165,7 +165,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
       - type=process, version als String
       - Infill als sparse_infill_density: "NN%"
       - G92 E0 aus before_layer_gcode entfernen
-      - compatible_printers maximal öffnen (inkl. "*")
+      - compatible_printers maximal öffnen (inkl. "*") + Condition neutralisieren
     """
     try:
         p = load_json(Path(src_path))
@@ -190,6 +190,8 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
         compat = []
     compat = list({*(x for x in compat if isinstance(x, str)), printer_name, base_name, "*"})
     p["compatible_printers"] = compat
+    # ❗ Wichtig: Condition leeren, damit kein interner Filter greift
+    p["compatible_printers_condition"] = ""
 
     out = workdir / "process_hardened.json"
     save_json(out, p)
@@ -197,7 +199,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
 
 def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     """
-    Filament-Profil normalisieren und Kompatibilität global erzwingen.
+    Filament-Profil normalisieren, global kompatibel + Condition neutralisieren.
     """
     try:
         f = load_json(Path(src_path))
@@ -207,8 +209,8 @@ def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     if "version" in f and not isinstance(f["version"], str):
         f["version"] = str(f["version"])
 
-    # ✅ Global kompatibel, um -17 durch Filament-Mismatch auszuschließen
     f["compatible_printers"] = ["*"]
+    f["compatible_printers_condition"] = ""
 
     out = workdir / "filament_hardened.json"
     save_json(out, f)
@@ -539,13 +541,14 @@ async def estimate_time(
             "name": "synthetic_infill_only",
             "sparse_infill_density": f"{pct}%",
             "before_layer_gcode": "",
-            "compatible_printers": list({printer_name, printer_name.split(" (")[0].strip(), "*"})
+            "compatible_printers": list({printer_name, printer_name.split(" (")[0].strip(), "*"}),
+            "compatible_printers_condition": ""
         }
         synth_path = work / "process_synthetic.json"
         save_json(synth_path, process_synth)
 
         # ---------- CLI-Kommandos ----------
-        # Ein --load-settings mit Semikolonliste, --slice 1, ohne --orient/--arrange
+        # Ein --load-settings mit Semikolonliste, --slice 1
         def base_cmd(load_proc: str) -> List[str]:
             load_list = f"{hardened_printer};{load_proc}"
             return [
@@ -644,7 +647,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 1). Settings via Semikolonliste, optionaler Try-4 mit getrennten --load-settings."
+            "notes": "Gesliced mit festen Profilen (--slice 1). Settings via Semikolonliste; Conditions neutralisiert; optionaler Try-4."
         }
     finally:
         try:
