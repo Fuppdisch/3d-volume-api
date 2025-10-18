@@ -197,7 +197,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
 
 def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     """
-    Filament-Profil minimal normalisieren und Kompatibilität maximal öffnen (inkl. "*").
+    Filament-Profil normalisieren und Kompatibilität global erzwingen.
     """
     try:
         f = load_json(Path(src_path))
@@ -207,11 +207,8 @@ def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     if "version" in f and not isinstance(f["version"], str):
         f["version"] = str(f["version"])
 
-    compat = f.get("compatible_printers")
-    if not isinstance(compat, list):
-        compat = []
-    compat = list({x for x in compat if isinstance(x, str)} | {"*"})
-    f["compatible_printers"] = compat
+    # ✅ Global kompatibel, um -17 durch Filament-Mismatch auszuschließen
+    f["compatible_printers"] = ["*"]
 
     out = workdir / "filament_hardened.json"
     save_json(out, f)
@@ -547,18 +544,21 @@ async def estimate_time(
         synth_path = work / "process_synthetic.json"
         save_json(synth_path, process_synth)
 
-        # ---------- CLI-Kommandos (getrennte --load-settings, --slice "1") ----------
+        # ---------- CLI-Kommandos ----------
+        # Ein --load-settings mit Semikolonliste + Orient/Arrange + Slice 1
         def base_cmd(load_proc: str) -> List[str]:
+            load_list = f"{hardened_printer};{load_proc}"
             return [
                 SLICER_BIN,
                 "--debug", str(int(debug) if isinstance(debug, int) else 0),
                 "--datadir", str(datadir),
-                "--load-settings", str(hardened_printer),
-                "--load-settings", str(load_proc),
+                "--load-settings", load_list,
                 "--load-filaments", str(hardened_filament),
                 "--export-slicedata", str(out_meta),
+                "--orient",
+                "--arrange", "1",
                 inp.as_posix(),
-                "--slice", "1",          # ✅ explizit 1
+                "--slice", "1",
                 "--export-3mf", str(out_3mf),
             ]
 
@@ -572,14 +572,13 @@ async def estimate_time(
         # Versuch 2: export-slicedata ans Ende
         if code != 0:
             cmd2 = [XVFB, "-a"] + [
-                SLICER_BIN,
-                "--debug", str(int(debug) if isinstance(debug, int) else 0),
+                SLICER_BIN, "--debug", str(int(debug) if isinstance(debug, int) else 0),
                 "--datadir", str(datadir),
-                "--load-settings", str(hardened_printer),
-                "--load-settings", str(hardened_process),
+                "--load-settings", f"{hardened_printer};{hardened_process}",
                 "--load-filaments", str(hardened_filament),
+                "--orient", "--arrange", "1",
                 inp.as_posix(),
-                "--slice", "1",          # ✅ explizit 1
+                "--slice", "1",
                 "--export-3mf", str(out_3mf),
                 "--export-slicedata", str(out_meta),
             ]
@@ -631,7 +630,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 1). Kompatibilität erzwungen; getrennte --load-settings."
+            "notes": "Gesliced mit festen Profilen (--orient, --arrange 1, --slice 1). Settings via Semikolonliste geladen."
         }
     finally:
         try:
