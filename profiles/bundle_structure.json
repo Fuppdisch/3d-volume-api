@@ -1,8 +1,8 @@
 {
   "bundle_id": "offline_X1C_20251018",
   "bundle_type": "printer config bundle",
-  "filament_config": ["filament/PLA.json"],
-  "printer_config": ["printer/X1C.json"],
+  "filament_config": ["process/filament/PLA.json"],
+  "printer_config": ["process/printer/X1C.json"],
   "printer_preset_name": "X1C",
   "process_config": ["process/0.20mm_standard.json"],
   "version": ""
