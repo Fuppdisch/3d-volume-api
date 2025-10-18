@@ -1,457 +1,512 @@
 # app.py
 from __future__ import annotations
+
+import io
 import json
 import os
-import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # ----------------------------
-# Konfiguration
+# Konstante Pfade (Variante A)
 # ----------------------------
-ORCA_BIN = os.environ.get("ORCA_BIN", "/opt/orca/bin/orca-slicer")
-REPO_DIR = Path(os.environ.get("PROFILES_DIR", "/app/profiles"))  # erwartet printer/, process/, filament/
-MAX_STD_TAIL = 1200  # Zeichen
+REPO_DIR = Path("/app/profiles")
+PRINTER_FILE = REPO_DIR / "printers" / "X1C.json"
+PROCESS_FILE = REPO_DIR / "process" / "0.20mm_standard.json"
+FILAMENT_DIR = REPO_DIR / "filaments"
 
-app = FastAPI(title="OrcaSlicer API", version="1.0.0")
-
+SUPPORTED_FILAMENTS = {"PLA", "PETG", "PC", "ASA"}
 
 # ----------------------------
-# Utilities
+# FastAPI Setup
 # ----------------------------
+app = FastAPI(title="OrcaSlicer API (Variante A)")
 
-def _tail(s: str, n: int = MAX_STD_TAIL) -> str:
-    s = s or ""
-    return s[-n:]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # bei Bedarf einschränken
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
+# ----------------------------
+# Utility
+# ----------------------------
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Datei nicht gefunden: {path}")
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"JSON fehlerhaft in {path}: {e}")
 
-def _ensure_float(v: Any) -> float:
-    if isinstance(v, (int, float)):
-        return float(v)
-    if isinstance(v, str):
-        # erlaubt "300" oder "300.0"
-        try:
-            return float(v.strip())
-        except Exception:
-            pass
-    raise ValueError(f"Expected number, got {type(v)}: {v!r}")
-
-
-def _ensure_int(v: Any) -> int:
-    if isinstance(v, int):
-        return v
-    if isinstance(v, float) and v.is_integer():
-        return int(v)
-    if isinstance(v, str):
-        try:
-            return int(float(v.strip()))
-        except Exception:
-            pass
-    raise ValueError(f"Expected integer, got {type(v)}: {v!r}")
-
-
-def _ensure_str(v: Any) -> str:
-    if isinstance(v, str):
-        return v
-    return str(v)
-
-
-def _ensure_float_list(v: Any) -> List[float]:
-    if isinstance(v, (list, tuple)):
-        return [ _ensure_float(x) for x in v ]
-    raise ValueError(f"Expected list of floats, got {type(v)}")
-
-
-def _ensure_string_list(v: Any) -> List[str]:
-    if isinstance(v, (list, tuple)):
-        return [ _ensure_str(x) for x in v ]
-    raise ValueError(f"Expected list of strings, got {type(v)}")
-
-
-def _coerce_bed_shape(val: Any) -> List[List[float]]:
-    """
-    akzeptiert:
-      ["0x0","400x0","400x400","0x400"]  -> [[0,0],[400,0],[400,400],[0,400]]
-      [[0,0],[400,0],[400,400],[0,400]] -> unverändert
-    """
-    if isinstance(val, list):
-        if all(isinstance(p, list) and len(p) == 2 for p in val):
-            return [[_ensure_float(p[0]), _ensure_float(p[1])] for p in val]
-        if all(isinstance(p, str) and "x" in p for p in val):
-            pairs = []
-            for s in val:
-                a, b = s.split("x", 1)
-                pairs.append([_ensure_float(a), _ensure_float(b)])
-            return pairs
-    raise ValueError("bed_shape must be list of [x,y] pairs or list of 'XxY' strings")
-
-
-def _inject_compat(pr: Dict[str, Any], printer_name: str) -> None:
-    """Sorgt dafür, dass der exakte Druckername in compatible_printers enthalten ist."""
-    key = "compatible_printers"
-    vals: List[str] = []
-    if key in pr:
-        try:
-            vals = _ensure_string_list(pr[key])
-        except Exception:
-            vals = []
-    if printer_name not in vals and "*" not in vals:
-        vals.append(printer_name)
-    pr[key] = vals
-    # leeres Bedingungsfeld erlaubt
-    pr.setdefault("compatible_printers_condition", "")
-
-
-def _coerce_machine_profile(js: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(js)
-    out["type"] = "machine"
-    out["printer_technology"] = _ensure_str(out.get("printer_technology", "FFF"))
-    out["gcode_flavor"] = _ensure_str(out.get("gcode_flavor", "marlin"))
-    out["name"] = _ensure_str(out.get("name", "Generic 400x400 0.4 nozzle"))
-    # häufige Felder -> sichere Typen
-    if "bed_shape" in out:
-        out["bed_shape"] = _coerce_bed_shape(out["bed_shape"])
-    else:
-        out["bed_shape"] = [[0.0,0.0],[400.0,0.0],[400.0,400.0],[0.0,400.0]]
-    out["max_print_height"] = _ensure_float(out.get("max_print_height", 300))
-    if "min_layer_height" in out:
-        out["min_layer_height"] = _ensure_float(out["min_layer_height"])
-    if "max_layer_height" in out:
-        out["max_layer_height"] = _ensure_float(out["max_layer_height"])
-    out["extruders"] = _ensure_int(out.get("extruders", 1))
-    # nozzle_diameter als Float-Liste
-    nd = out.get("nozzle_diameter", [0.4])
-    if isinstance(nd, list):
-        out["nozzle_diameter"] = _ensure_float_list(nd)
-    else:
-        out["nozzle_diameter"] = [_ensure_float(nd)]
-    # optionale Meta
-    out.setdefault("printer_model", _ensure_str(out.get("printer_model", "Generic 400x400")))
-    out.setdefault("printer_variant", _ensure_str(out.get("printer_variant", "0.4")))
-    return out
-
-
-def _coerce_process_profile(js: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(js)
-    out["type"] = "process"
-    # nichts hart validieren, nur offensichtliche Zahlenfelder glätten, falls vorhanden
-    for k in ("layer_height","first_layer_height","line_width","perimeter_extrusion_width",
-              "external_perimeter_extrusion_width","infill_extrusion_width"):
-        if k in out:
-            try:
-                out[k] = str(_ensure_float(out[k]))
-            except Exception:
-                pass
-    # Geschwindigkeiten/… als Strings lassen (Orca akzeptiert Strings für ini/json Felder häufig)
-    return out
-
-
-def _coerce_filament_profile(js: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(js)
-    out["type"] = "filament"
-    return out
-
-
-def _read_json_file(p: Path) -> Dict[str, Any]:
-    with p.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _write_json_file(p: Path, data: Dict[str, Any]) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("w", encoding="utf-8") as f:
+def _write_json_file(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-def _run_orca(args: List[str]) -> Tuple[int, str, str]:
-    cmd = ["xvfb-run", "-a", ORCA_BIN] + args
-    proc = subprocess.run(
-        cmd, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    return proc.returncode, proc.stdout, proc.stderr
-
-
-def _build_cli(
-    datadir: Path,
-    printer_json: Path,
-    process_json: Path,
-    filament_json: Path,
-    stl_path: Path,
-    do_arrange: bool = True,
-    do_orient: bool = True,
-    plate: int = 1,
-    export_3mf: Optional[Path] = None,
-    export_slicedata: Optional[Path] = None,
-) -> List[str]:
-    args: List[str] = [
-        "--debug", "0",
-        "--datadir", str(datadir),
-        "--load-settings", f"{printer_json};{process_json}",
-        "--load-filaments", str(filament_json),
-    ]
-    if do_arrange:
-        args += ["--arrange", "1"]
-    if do_orient:
-        args += ["--orient", "1"]
-
-    args += [str(stl_path), "--slice", str(plate)]
-
-    if export_3mf:
-        args += ["--export-3mf", str(export_3mf)]
-    if export_slicedata:
-        args += ["--export-slicedata", str(export_slicedata)]
-    return args
-
-
-# ----------------------------
-# Modelle für Requests
-# ----------------------------
-
-class SliceOptions(BaseModel):
-    material: Optional[str] = "PLA"         # Filament-Dateiname ohne .json unter /app/profiles/filament
-    infill: Optional[str] = "35%"           # wird in process injiziert als sparse_infill_density, falls gesetzt
-    printer_name: Optional[str] = None      # überschreibt den Namen im Printer-Profil (für kompatible_printers)
-    arrange: Optional[bool] = True
-    orient: Optional[bool] = True
-
-
-# ----------------------------
-# Endpunkte
-# ----------------------------
-
-@app.get("/health")
-def health():
-    bin_exists = Path(ORCA_BIN).exists()
-    which = shutil.which(ORCA_BIN) or ""
-    return {
-        "ok": True,
-        "orca_bin": ORCA_BIN,
-        "bin_exists": bin_exists,
-        "which": which,
-        "repo_present": REPO_DIR.exists(),
-    }
-
-
-@app.post("/import_bundle")
-async def import_bundle(zip_file: UploadFile = File(...)):
-    """
-    Erwartet ein ZIP mit:
-      bundle_structure.json
-      printer/*.json
-      process/*.json
-      filament/*.json
-
-    Importiert NICHT dauerhaft in /app/profiles,
-    sondern prüft Struktur & gibt die gelesenen Inhalte zurück.
-    (Dauerhafte Installation wäre optional.)
-    """
-    with tempfile.TemporaryDirectory() as td:
-        tdir = Path(td)
-        zpath = tdir / "bundle.zip"
-        with zpath.open("wb") as f:
-            f.write(await zip_file.read())
-        shutil.unpack_archive(str(zpath), str(tdir))
-
-        bs = tdir / "bundle_structure.json"
-        if not bs.exists():
-            return JSONResponse(status_code=400, content={"ok": False, "error": "bundle_structure.json fehlt"})
-
-        meta = _read_json_file(bs)
-
-        # Dateien laden
-        printer_files = [tdir / p for p in meta.get("printer_config", [])]
-        process_files = [tdir / p for p in meta.get("process_config", [])]
-        filament_files = [tdir / p for p in meta.get("filament_config", [])]
-
-        def load_list(paths: List[Path]) -> List[Dict[str, Any]]:
-            out = []
-            for p in paths:
-                if not p.exists():
-                    raise FileNotFoundError(f"Bundle referenziert fehlende Datei: {p}")
-                out.append(_read_json_file(p))
-            return out
-
+def _to_float(x: Any) -> float:
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
         try:
-            printers = load_list(printer_files)
-            processes = load_list(process_files)
-            filaments = load_list(filament_files)
-        except Exception as e:
-            return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+            return float(x.strip())
+        except ValueError:
+            pass
+    raise ValueError(f"Kann nicht in float konvertieren: {x!r}")
 
-        return {
-            "ok": True,
-            "bundle_meta": meta,
-            "counts": {
-                "printers": len(printers),
-                "processes": len(processes),
-                "filaments": len(filaments),
-            },
-            "previews": {
-                "printer_first": printers[0] if printers else None,
-                "process_first": processes[0] if processes else None,
-                "filament_first": filaments[0] if filaments else None,
-            }
-        }
+def _to_int(x: Any) -> int:
+    if isinstance(x, int):
+        return x
+    if isinstance(x, float):
+        return int(x)
+    if isinstance(x, str):
+        try:
+            return int(float(x.strip()))
+        except ValueError:
+            pass
+    raise ValueError(f"Kann nicht in int konvertieren: {x!r}")
 
+def _string_pair_to_xy(s: str) -> Tuple[float, float]:
+    # "400x0" -> (400.0, 0.0)
+    if isinstance(s, str) and "x" in s:
+        a, b = s.split("x", 1)
+        return (_to_float(a), _to_float(b))
+    raise ValueError(f"Kein 'AxB'-String: {s!r}")
 
-@app.post("/slice")
-async def slice_endpoint(
-    model: UploadFile = File(...),
-    options_json: Optional[str] = Form(None)
+def _ensure_bed_shape(machine: Dict[str, Any]) -> None:
+    """
+    Orca erwartet bed_shape als Liste von Float-Paaren. Konvertiere ggf. von printable_area Strings.
+    """
+    if "bed_shape" in machine and isinstance(machine["bed_shape"], list):
+        # bereits korrekt? (Liste von Paaren)
+        pairs = []
+        for p in machine["bed_shape"]:
+            if isinstance(p, (list, tuple)) and len(p) == 2:
+                pairs.append((_to_float(p[0]), _to_float(p[1])))
+            elif isinstance(p, str):
+                pairs.append(_string_pair_to_xy(p))
+            else:
+                raise ValueError("bed_shape-Element hat unerwartetes Format")
+        machine["bed_shape"] = pairs
+        return
+
+    # Fallback aus printable_area: ["0x0","400x0","400x400","0x400"]
+    if "printable_area" in machine and isinstance(machine["printable_area"], list):
+        pairs = [_string_pair_to_xy(s) for s in machine["printable_area"]]
+        machine["bed_shape"] = pairs
+        # printable_area optional entfernen (stört nicht – lassen wir stehen)
+    else:
+        # Minimal-Bett, wenn gar nichts da ist
+        machine["bed_shape"] = [(0.0, 0.0), (200.0, 0.0), (200.0, 200.0), (0.0, 200.0)]
+
+def _harden_machine(raw: Dict[str, Any]) -> Dict[str, Any]:
+    m = dict(raw)
+    m.setdefault("type", "machine")
+    m.setdefault("version", "1")
+    m.setdefault("from", "user")
+    m.setdefault("printer_technology", "FFF")
+    m.setdefault("gcode_flavor", "marlin")
+
+    # Pflichtfelder sauber tippen:
+    _ensure_bed_shape(m)
+
+    if "max_print_height" in m:
+        m["max_print_height"] = _to_float(m["max_print_height"])
+    else:
+        m["max_print_height"] = 300.0
+
+    if "min_layer_height" in m:
+        m["min_layer_height"] = _to_float(m["min_layer_height"])
+    if "max_layer_height" in m:
+        m["max_layer_height"] = _to_float(m["max_layer_height"])
+
+    if "extruders" in m:
+        m["extruders"] = _to_int(m["extruders"])
+    else:
+        m["extruders"] = 1
+
+    # nozzle_diameter als Float-Liste
+    nd = m.get("nozzle_diameter", [0.4])
+    if not isinstance(nd, list):
+        nd = [nd]
+    m["nozzle_diameter"] = [_to_float(v) for v in nd]
+
+    # Name ableiten falls nicht gesetzt
+    if "name" not in m:
+        variant = str(m["nozzle_diameter"][0])
+        derived = f'Generic {int(m["bed_shape"][2][0])}x{int(m["bed_shape"][2][1])} {variant} nozzle'
+        m["name"] = derived
+
+    return m
+
+def _harden_process(raw: Dict[str, Any]) -> Dict[str, Any]:
+    p = dict(raw)
+    p.setdefault("type", "process")
+    p.setdefault("version", "1")
+    p.setdefault("from", "user")
+    # nichts Aggressives – nur sicherstellen, dass Strings Zahlen sind, wo sinnvoll
+    # (Orca parst viele Felder intern, hier lassen wir sie meist als String)
+
+    # Manche Key-Varianten harmonisieren:
+    if "initial_layer_height" in p and "first_layer_height" not in p:
+        p["first_layer_height"] = p["initial_layer_height"]
+
+    return p
+
+def _harden_filament(raw: Dict[str, Any]) -> Dict[str, Any]:
+    f = dict(raw)
+    f.setdefault("type", "filament")
+    f.setdefault("from", "user")
+    if "filament_diameter" in f:
+        # kann Liste oder Zahl/String sein – Orca akzeptiert meist Liste
+        d = f["filament_diameter"]
+        if not isinstance(d, list):
+            d = [d]
+        f["filament_diameter"] = [str(v) for v in d]
+    return f
+
+def _inject_compat(profile: Dict[str, Any], printer_name: str) -> None:
+    """
+    Sorgt dafür, dass compatible_printers den exakten Printer-Namen enthält.
+    """
+    lst = profile.get("compatible_printers")
+    if lst is None:
+        profile["compatible_printers"] = [printer_name]
+    else:
+        if not isinstance(lst, list):
+            lst = [lst]
+        if printer_name not in lst:
+            lst.append(printer_name)
+        profile["compatible_printers"] = lst
+    # optional: compatible_printers_condition leer halten
+    profile.setdefault("compatible_printers_condition", "")
+
+def _choose_slicer_bin() -> Optional[str]:
+    candidates = [
+        "/opt/orca/bin/orca-slicer",
+        "/usr/local/bin/orca-slicer",
+        "/usr/bin/orca-slicer",
+        "orca-slicer",
+    ]
+    for c in candidates:
+        if shutil.which(c):
+            return shutil.which(c)
+    return None
+
+def _run(cmd: List[str], cwd: Optional[Path] = None, timeout: int = 120) -> Tuple[int, str, str]:
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            text=True,
+        )
+        return p.returncode, p.stdout, p.stderr
+    except Exception as e:
+        return 997, "", f"{type(e).__name__}: {e}"
+
+def _profile_paths_for_material(material: str) -> Tuple[Path, Path, Path]:
+    prn = PRINTER_FILE
+    proc = PROCESS_FILE
+    fil = FILAMENT_DIR / f"{material.upper()}.json"
+    if material.upper() not in SUPPORTED_FILAMENTS:
+        raise HTTPException(status_code=400, detail=f"Unbekanntes Material '{material}'. Erlaubt: {sorted(SUPPORTED_FILAMENTS)}")
+    if not prn.exists():
+        raise HTTPException(status_code=404, detail=f"Printer-Profil fehlt: {prn}")
+    if not proc.exists():
+        raise HTTPException(status_code=404, detail=f"Process-Profil fehlt: {proc}")
+    if not fil.exists():
+        raise HTTPException(status_code=404, detail=f"Filament-Profil fehlt: {fil}")
+    return prn, proc, fil
+
+def _harden_and_stage_profiles(printer: Path, process: Path, filament: Path, work: Path) -> Tuple[Path, Path, Path, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    raw_machine = _read_json_file(printer)
+    raw_process = _read_json_file(process)
+    raw_filament = _read_json_file(filament)
+
+    machine = _harden_machine(raw_machine)
+    process_h = _harden_process(raw_process)
+    filament_h = _harden_filament(raw_filament)
+
+    printer_name = machine.get("name", "Generic")
+
+    _inject_compat(process_h, printer_name)
+    _inject_compat(filament_h, printer_name)
+
+    out_prn = work / "printer_hardened.json"
+    out_proc = work / "process_hardened.json"
+    out_fil = work / "filament_hardened.json"
+
+    _write_json_file(out_prn, machine)
+    _write_json_file(out_proc, process_h)
+    _write_json_file(out_fil, filament_h)
+
+    return out_prn, out_proc, out_fil, machine, process_h, filament_h
+
+# ----------------------------
+# Root: Mini-UI zum Testen
+# ----------------------------
+ROOT_HTML = """
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>OrcaSlicer API – Test</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; line-height: 1.4; }
+    code, pre { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; }
+    button { padding: 8px 12px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin: 12px 0; }
+    .ok { color: #0a7f27; font-weight: 600; }
+    .err { color: #b00020; font-weight: 600; }
+    input[type="file"] { padding: 8px; }
+    label { font-size: 14px; color: #444; }
+    .grid { display:grid; grid-template-columns: 160px 1fr; gap:8px 12px; align-items:center; }
+  </style>
+</head>
+<body>
+  <h1>OrcaSlicer API – Testseite</h1>
+  <div class="row">
+    <button id="btnHealth">Health</button>
+    <button id="btnEnv">Slicer Env</button>
+    <a href="/docs" target="_blank"><button>Swagger (API-Doku)</button></a>
+  </div>
+
+  <pre id="out" class="card" style="white-space:pre-wrap;">Output…</pre>
+
+  <h2>/slice_check</h2>
+  <form id="sliceForm" class="card">
+    <div class="grid">
+      <label>STL:</label><input type="file" name="file" accept=".stl" required>
+      <label>unit:</label><select name="unit">
+        <option value="mm">mm</option>
+        <option value="in">in</option>
+      </select>
+      <label>material:</label><select name="material">
+        <option>PLA</option><option>PETG</option><option>PC</option><option>ASA</option>
+      </select>
+      <label>infill:</label><input name="infill" type="number" step="0.01" value="0.2">
+      <label>layer_height:</label><input name="layer_height" type="number" step="0.01" value="0.2">
+      <label>nozzle:</label><input name="nozzle" type="number" step="0.01" value="0.4">
+    </div>
+    <div style="margin-top:12px;">
+      <button type="submit">Check starten</button>
+    </div>
+  </form>
+
+<script>
+const outEl = document.getElementById('out');
+
+document.getElementById('btnHealth').onclick = async () => {
+  const r = await fetch('/health');
+  outEl.textContent = await r.text();
+};
+
+document.getElementById('btnEnv').onclick = async () => {
+  const r = await fetch('/slicer_env');
+  outEl.textContent = JSON.stringify(await r.json(), null, 2);
+};
+
+document.getElementById('sliceForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const r = await fetch('/slice_check', { method: 'POST', body: fd });
+  const ct = r.headers.get('content-type')||'';
+  if (ct.includes('application/json')) {
+    outEl.textContent = JSON.stringify(await r.json(), null, 2);
+  } else {
+    outEl.textContent = await r.text();
+  }
+};
+</script>
+</body>
+</html>
+"""
+
+# ----------------------------
+# Endpoints
+# ----------------------------
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    # Kein f-string – roher String wegen JS-Klammern
+    return HTMLResponse(content=ROOT_HTML)
+
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return "ok"
+
+@app.get("/slicer_env")
+def slicer_env():
+    binpath = _choose_slicer_bin()
+    data = {
+        "slicer_present": bool(binpath),
+        "slicer_bin": binpath,
+        "profiles": {
+            "printer": [str(PRINTER_FILE)] if PRINTER_FILE.exists() else [],
+            "process": [str(PROCESS_FILE)] if PROCESS_FILE.exists() else [],
+            "filament": [str(p) for p in FILAMENT_DIR.glob("*.json")],
+        },
+    }
+    if binpath:
+        # OrcaSlicer –help als „Version/Hilfe“-Schnipsel
+        code, out, err = _run([binpath, "--help"])
+        data["return_code"] = code
+        data["help_snippet"] = (out or err or "").splitlines()[:30]
+    return JSONResponse(content=data)
+
+@app.post("/slice_check")
+async def slice_check(
+    file: UploadFile = File(...),
+    unit: str = Form("mm"),
+    material: str = Form("PLA"),
+    infill: float = Form(0.2),
+    layer_height: float = Form(0.2),
+    nozzle: float = Form(0.4),
 ):
     """
-    Sliced eine STL mit Repo-Profilen.
-    - ergänzt kompatible_printers automatisch
-    - coerct Typen in Printer/Process/Filament
-    - wendet optional infill (sparse_infill_density) an
+    Führt einen 'trocken'-Slicinglauf mit Repo-Profilen aus:
+    - Profile werden gehärtet und kompatibel gemacht
+    - Modell wird optional orientiert/arrangiert
+    - Es wird 3MF + slicedata exportiert (zur Validierung)
     """
-    try:
-        opts = SliceOptions.model_validate_json(options_json) if options_json else SliceOptions()
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"ok": False, "error": f"options_json invalid: {e}"})
+    binpath = _choose_slicer_bin()
+    if not binpath:
+        raise HTTPException(status_code=500, detail="Orca-Slicer CLI nicht gefunden.")
 
-    # Repo-Dateien
-    printer_repo = REPO_DIR / "printers" / "X1C.json"  # du hast diesen Namen im Repo
-    process_repo = REPO_DIR / "process" / "0.20mm_standard.json"
-    filament_repo = REPO_DIR / "filaments" / f"{opts.material}.json"
+    if unit not in {"mm", "in"}:
+        raise HTTPException(status_code=400, detail="unit muss 'mm' oder 'in' sein.")
 
-    if not printer_repo.exists() or not process_repo.exists() or not filament_repo.exists():
-        return JSONResponse(
-            status_code=400,
-            content={
-                "ok": False,
-                "error": "Repo-Profile fehlen",
-                "paths": {
-                    "printer": str(printer_repo),
-                    "process": str(process_repo),
-                    "filament": str(filament_repo),
-                },
-            },
-        )
+    # Profilpfade wählen
+    prn_path, proc_path, fil_path = _profile_paths_for_material(material)
 
     # Arbeitsverzeichnis
-    with tempfile.TemporaryDirectory() as td:
+    with tempfile.TemporaryDirectory(prefix="fixedp_") as td:
         tdir = Path(td)
-        datadir = tdir / "cfg"
-        datadir.mkdir(parents=True, exist_ok=True)
 
-        stl_path = tdir / "input.stl"
-        with stl_path.open("wb") as f:
-            f.write(await model.read())
+        # Eingabedatei schreiben
+        input_name = "input.stl"
+        model_path = tdir / input_name
+        model_bytes = await file.read()
+        model_path.write_bytes(model_bytes)
 
-        # Profile laden & härten
-        raw_printer = _read_json_file(printer_repo)
-        raw_process = _read_json_file(process_repo)
-        raw_filament = _read_json_file(filament_repo)
-
-        # Coercion
-        machine = _coerce_machine_profile(raw_printer)
-        process = _coerce_process_profile(raw_process)
-        filament = _coerce_filament_profile(raw_filament)
-
-        # Druckername
-        printer_name = opts.printer_name or machine.get("name") or "Generic 400x400 0.4 nozzle"
-        machine["name"] = printer_name
-
-        # kompatible_printers injizieren
-        _inject_compat(process, printer_name)
-        _inject_compat(filament, printer_name)
-
-        # optional Infill überschreiben
-        if opts.infill:
-            process["sparse_infill_density"] = _ensure_str(opts.infill)
-
-        # Dateien schreiben
-        p_printer = tdir / "printer.json"
-        p_process = tdir / "process.json"
-        p_filament = tdir / "filament.json"
-        _write_json_file(p_printer, machine)
-        _write_json_file(p_process, process)
-        _write_json_file(p_filament, filament)
-
-        out_3mf = tdir / "out.3mf"
-        slice_dir = tdir / "slicedata"
-
-        args = _build_cli(
-            datadir=datadir,
-            printer_json=p_printer,
-            process_json=p_process,
-            filament_json=p_filament,
-            stl_path=stl_path,
-            do_arrange=bool(opts.arrange),
-            do_orient=bool(opts.orient),
-            plate=1,
-            export_3mf=out_3mf,
-            export_slicedata=slice_dir,
+        # Profile härten + stagen
+        out_prn, out_proc, out_fil, machine, proc_h, fil_h = _harden_and_stage_profiles(
+            prn_path, proc_path, fil_path, tdir
         )
 
-        code, stdout, stderr = _run_orca(args)
+        # Felder überschreiben, falls gewünscht (layer_height, nozzle, infill)
+        try:
+            # Layerhöhe in Process
+            if layer_height:
+                proc_h["layer_height"] = str(layer_height)
+                # first_layer_height nur überschreiben, wenn nicht gesetzt
+                if "first_layer_height" not in proc_h:
+                    proc_h["first_layer_height"] = str(max(layer_height, 0.2))
 
-        result = {
-            "ok": code == 0,
+            # Düse im Machine-Profil (nur erste Düse)
+            if nozzle:
+                machine["nozzle_diameter"] = [float(nozzle)]
+
+            # Infill
+            if infill is not None:
+                # Orca akzeptiert z. B. "35%" oder Zahl. Wir verwenden Prozent-String.
+                pct = f"{int(round(infill * 100))}%"
+                proc_h["sparse_infill_density"] = pct
+
+            # aktualisierte Profile erneut schreiben
+            _write_json_file(out_proc, proc_h)
+            _write_json_file(out_prn, machine)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Profil-Override fehlgeschlagen: {e}")
+
+        # Ausgabepfade
+        out_3mf = tdir / "out.3mf"
+        out_slicedata = tdir / "slicedata"
+
+        # CLI Kommando
+        cmd = [
+            "xvfb-run", "-a", binpath,
+            "--debug", "0",
+            "--datadir", str(tdir / "cfg"),
+            "--load-settings", f"{out_prn};{out_proc}",
+            "--load-filaments", str(out_fil),
+            "--arrange", "1",
+            "--orient", "1",
+            str(model_path),
+            "--slice", "1",
+            "--export-3mf", str(out_3mf),
+            "--export-slicedata", str(out_slicedata),
+        ]
+
+        code, out, err = _run(cmd, cwd=tdir, timeout=300)
+
+        ok = (code == 0)
+        detail = {
+            "message": "Slicing erfolgreich." if ok else "Slicing fehlgeschlagen.",
+            "ok": ok,
             "code": code,
-            "cmd": " ".join(["xvfb-run", "-a", ORCA_BIN] + args),
-            "stdout_tail": _tail(stdout),
-            "stderr_tail": _tail(stderr),
+            "cmd": " ".join(cmd),
+            "stdout_tail": (out or "")[-500:],
+            "stderr_tail": (err or "")[-500:],
             "profiles_used": {
+                "printer": str(out_prn),
+                "process": str(out_proc),
+                "filament": str(out_fil),
+            },
+            "profile_debug": {
                 "printer_preview": machine,
-                "process_preview": process,
-                "filament_preview": filament,
-            }
+                "process_preview": proc_h,
+                "filament_preview": fil_h,
+            },
+            "model": {
+                "filename": file.filename,
+                "bytes": len(model_bytes),
+                "unit": unit,
+            },
         }
 
-        if code != 0:
-            # häufige Fehlerhinweise ergänzen
-            hints: List[str] = []
-            if "process not compatible with printer" in stdout or "process not compatible with printer" in stderr:
-                hints.append("Process/Filament enthält den Printer-Namen evtl. nicht in compatible_printers.")
-                hints.append("Typen prüfen: bed_shape (Float-Paare), max_print_height (Zahl), extruders (int), nozzle_diameter (Float-Liste).")
-            if "its_convex_hull" in stdout or "its_convex_hull" in stderr:
-                hints.append("bed_shape muss numerisch und konvex sein (z. B. [[0,0],[400,0],[400,400],[0,400]]).")
-            if "Invalid option --load" in stdout or "Invalid option --load" in stderr:
-                hints.append("Benutze --load-settings und --load-filaments, nicht --load.")
+        return JSONResponse(content={"detail": detail}, status_code=200 if ok else 500)
 
-            if hints:
-                result["hints"] = hints
-
-            return JSONResponse(status_code=500, content=result)
-
-        # Erfolg
-        return result
-
-
-@app.post("/selftest")
-def selftest():
-    """Prüft Orca-Binary & Repo-Struktur, ohne zu slicen."""
-    exists = Path(ORCA_BIN).exists()
-    which = shutil.which(ORCA_BIN) or ""
-    present = {
-        "printer": (REPO_DIR / "printers" / "X1C.json").exists(),
-        "process": (REPO_DIR / "process" / "0.20mm_standard.json").exists(),
-        "filament_PLA": (REPO_DIR / "filaments" / "PLA.json").exists(),
-        "bundle_structure": (REPO_DIR / "bundle_structure.json").exists(),
-    }
-    return {
-        "ok": exists and all(present.values()),
-        "orca_bin": ORCA_BIN,
-        "bin_exists": exists,
-        "which": which,
-        "repo_checks": present,
-    }
-
+# Optionaler „Produktiv“-Slice (gleiches Prinzip wie slice_check).
+@app.post("/slice")
+async def slice_endpoint(
+    file: UploadFile = File(...),
+    material: str = Form("PLA"),
+    infill: float = Form(0.2),
+    layer_height: float = Form(0.2),
+    nozzle: float = Form(0.4),
+):
+    # Für jetzt delegieren wir auf slice_check – später könnte hier G-code Export hinzukommen.
+    return await slice_check(
+        file=file,
+        unit="mm",
+        material=material,
+        infill=infill,
+        layer_height=layer_height,
+        nozzle=nozzle,
+    )
 
 # ----------------------------
-# Main
+# Uvicorn Entrypoint
 # ----------------------------
-
 if __name__ == "__main__":
-    # Hinweis: Kein Inline-JS, keine f-Strings mit '{' in Literalen -> verhindert SyntaxError bei Deploy
+    # Lokaler Start: uvicorn app:app --reload --host 0.0.0.0 --port 8000
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), reload=False)
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
