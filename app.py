@@ -141,18 +141,20 @@ def harden_printer_profile(src_path: str, workdir: Path) -> Tuple[str, dict, str
         raise HTTPException(500, f"Printer-Profil ungültig: {e}")
 
     j["type"] = "machine"
-    # Manche Exporte haben numerische nozzle_diameter – Orca akzeptiert beides,
-    # aber Arrays aus Mischtypen können Probleme machen → normalisieren auf float.
-    if isinstance(j.get("nozzle_diameter"), list):
-        j["nozzle_diameter"] = [float(x) for x in j["nozzle_diameter"]]
-    elif "nozzle_diameter" in j:
-        try:
-            j["nozzle_diameter"] = [float(j["nozzle_diameter"])]
-        except Exception:
-            pass
+
+    # ✅ WICHTIG: Orca erwartet STRINGS in nozzle_diameter
+    nd = j.get("nozzle_diameter")
+    if isinstance(nd, list):
+        j["nozzle_diameter"] = [str(x) for x in nd]
+    elif nd is not None:
+        j["nozzle_diameter"] = [str(nd)]
 
     if not j.get("name"):
         j["name"] = Path(src_path).stem
+
+    # optional: version als String absichern
+    if "version" in j and not isinstance(j["version"], str):
+        j["version"] = str(j["version"])
 
     out = workdir / "printer_hardened.json"
     save_json(out, j)
@@ -162,6 +164,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
     """
     Process-Profil härten:
       - type=process
+      - version als String
       - Infill einheitlich als sparse_infill_density: "NN%"
       - G92 E0 aus before_layer_gcode entfernen (verträgt sich nicht mit absolutem E)
       - compatible_printers auf den tatsächlich verwendeten Printer setzen
@@ -172,6 +175,11 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
         raise HTTPException(500, f"Process-Profil ungültig: {e}")
 
     p["type"] = "process"
+    if "version" in p and not isinstance(p["version"], str):
+        p["version"] = str(p["version"])
+    else:
+        p.setdefault("version", "1")
+
     # Einheitliches Infill als Prozent-String:
     p.pop("fill_density", None)
     p["sparse_infill_density"] = f"{int(max(0, min(100, infill_pct)))}%"
@@ -185,8 +193,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
     if not isinstance(cp, list):
         cp = []
     base_name = printer_name.split(" (")[0].strip()
-    compat = list({printer_name, base_name})
-    p["compatible_printers"] = compat
+    p["compatible_printers"] = list({printer_name, base_name})
 
     out = workdir / "process_hardened.json"
     save_json(out, p)
@@ -201,6 +208,9 @@ def harden_filament_profile(src_path: str, workdir: Path) -> Tuple[str, dict]:
     except Exception as e:
         raise HTTPException(500, f"Filament-Profil ungültig: {e}")
     f["type"] = "filament"
+    # version optional auf String
+    if "version" in f and not isinstance(f["version"], str):
+        f["version"] = str(f["version"])
     out = workdir / "filament_hardened.json"
     save_json(out, f)
     return str(out), f
@@ -522,10 +532,11 @@ async def estimate_time(
         hardened_process, process_json = harden_process_profile(pick_process0, work, infill_pct=pct, printer_name=printer_name)
         hardened_filament, _ = harden_filament_profile(pick_filament, work)
 
-        # Minimales, vollwertiges Synthetic-Fallback-Process:
+        # ✅ Synthetic-Fallback-Process (Strings!)
         process_synth = {
             "type": "process",
-            "version": 1,
+            "version": "1",
+            "from": "user",
             "name": "synthetic_infill_only",
             "sparse_infill_density": f"{pct}%",
             "before_layer_gcode": "",
