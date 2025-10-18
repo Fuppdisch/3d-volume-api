@@ -190,7 +190,7 @@ def harden_process_profile(src_path: str, workdir: Path, *, infill_pct: int, pri
         compat = []
     compat = list({*(x for x in compat if isinstance(x, str)), printer_name, base_name, "*"})
     p["compatible_printers"] = compat
-    # ❗ Wichtig: Condition leeren, damit kein interner Filter greift
+    # ❗ Wichtig: Bedingung leeren, damit kein interner Filter greift
     p["compatible_printers_condition"] = ""
 
     out = workdir / "process_hardened.json"
@@ -479,6 +479,73 @@ async def analyze_upload(file: UploadFile = File(...)):
         raise HTTPException(500, f"Analyse fehlgeschlagen: {e}")
 
 # ------------------------------------------------------------------------------
+# INI-Fallback: aus JSON-Profilen eine flache .ini erzeugen
+# ------------------------------------------------------------------------------
+def write_merged_ini(printer: dict, process: dict, filament: dict, dst: Path) -> Path:
+    """
+    Erzeugt eine minimal-kompatible .ini (Prusa/Orca Stil), die
+    direkt via `--load` eingelesen wird. Dadurch entfällt jede
+    Preset-Kompatibilitätsprüfung.
+    """
+    bed_poly = printer.get("printable_area") or ["0x0","250x0","250x250","0x250"]
+    if isinstance(bed_poly, list):
+        bed_shape = ",".join(bed_poly)
+    else:
+        bed_shape = "0x0,250x0,250x250,0x250"
+
+    nozzle = printer.get("nozzle_diameter") or ["0.4"]
+    if isinstance(nozzle, list):
+        nozzle_str = ",".join(str(x) for x in nozzle)
+    else:
+        nozzle_str = str(nozzle)
+
+    layer_height = process.get("layer_height") or "0.2"
+    first_layer = process.get("initial_layer_height") or process.get("first_layer_height") or "0.3"
+    infill = process.get("sparse_infill_density") or "20%"
+    if isinstance(infill, str) and infill.endswith("%"):
+        infill = infill[:-1]
+    try:
+        infill_num = float(str(infill).replace(",", "."))
+    except Exception:
+        infill_num = 20.0
+
+    noz = (filament.get("nozzle_temperature") or ["200"])
+    noz_first = (filament.get("nozzle_temperature_initial_layer") or [noz[0] if isinstance(noz, list) and noz else "205"])
+    bed_temp = filament.get("bed_temperature") or ["0"]
+
+    def first_val(x, default="0"):
+        if isinstance(x, list) and x:
+            return str(x[0])
+        if isinstance(x, (int, float)):
+            return str(x)
+        if isinstance(x, str):
+            return x
+        return default
+
+    ini_lines = [
+        # --- Printer ---
+        f"bed_shape = {bed_shape}",
+        f"nozzle_diameter = {nozzle_str}",
+        # --- Heights / Infill (Process) ---
+        f"layer_height = {layer_height}",
+        f"first_layer_height = {first_layer}",
+        f"fill_density = {infill_num}",            # Prozent (ohne %)
+        # --- Filament basics ---
+        f"temperature = {first_val(noz, '200')}",
+        f"first_layer_temperature = {first_val(noz_first, '205')}",
+        f"bed_temperature = {first_val(bed_temp, '0')}",
+        f"first_layer_bed_temperature = {first_val(bed_temp, '0')}",
+        # --- Misc ---
+        f"use_relative_e_distances = {process.get('use_relative_e_distances','0')}",
+        f"perimeter_extrusion_width = {process.get('line_width','0.45')}",
+        f"external_perimeter_extrusion_width = {process.get('line_width','0.45')}",
+        f"infill_extrusion_width = {process.get('line_width','0.45')}",
+    ]
+
+    dst.write_text("\n".join(ini_lines) + "\n", encoding="utf-8")
+    return dst
+
+# ------------------------------------------------------------------------------
 # Slicing / Druckzeit
 # ------------------------------------------------------------------------------
 @app.post("/estimate_time", response_class=JSONResponse)
@@ -531,9 +598,9 @@ async def estimate_time(
         # Profile härten – Reihenfolge wichtig!
         hardened_printer, printer_json, printer_name = harden_printer_profile(pick_printer, work)
         hardened_process, process_json = harden_process_profile(pick_process0, work, infill_pct=pct, printer_name=printer_name)
-        hardened_filament, _ = harden_filament_profile(pick_filament, work)
+        hardened_filament, filament_json = harden_filament_profile(pick_filament, work)
 
-        # Synthetic-Fallback-Process (Strings, kompatibel)
+        # Synthetic-Fallback-Process (nur Infill + Kompatibilität)
         process_synth = {
             "type": "process",
             "version": "1",
@@ -548,7 +615,7 @@ async def estimate_time(
         save_json(synth_path, process_synth)
 
         # ---------- CLI-Kommandos ----------
-        # Ein --load-settings mit Semikolonliste, --slice 1
+        # Ein --load-settings mit Semikolonliste, --slice 1 (keine --orient/--arrange)
         def base_cmd(load_proc: str) -> List[str]:
             load_list = f"{hardened_printer};{load_proc}"
             return [
@@ -593,7 +660,7 @@ async def estimate_time(
             attempts.append({"tag": "try-3", "cmd": " ".join(cmd3), "stderr_tail": (err3 or out3)[-800:]})
             code, out, err = code3, out3, err3
 
-        # Versuch 4 (optional): getrennte --load-settings
+        # Versuch 4: getrennte --load-settings (manche Builds mögen das)
         if code != 0:
             cmd4 = [XVFB, "-a"] + [
                 SLICER_BIN, "--debug", str(int(debug) if isinstance(debug, int) else 0),
@@ -609,6 +676,23 @@ async def estimate_time(
             code4, out4, err4 = run(cmd4, timeout=900)
             attempts.append({"tag": "try-4", "cmd": " ".join(cmd4), "stderr_tail": (err4 or out4)[-800:]})
             code, out, err = code4, out4, err4
+
+        # Versuch 5: INI-Fallback – umgeht Preset-Checks komplett
+        if code != 0:
+            merged_ini = work / "merged_fallback.ini"
+            write_merged_ini(printer_json, process_json, filament_json, merged_ini)
+            cmd5 = [XVFB, "-a"] + [
+                SLICER_BIN, "--debug", str(int(debug) if isinstance(debug, int) else 0),
+                "--datadir", str(datadir),
+                "--load", str(merged_ini),           # << .ini statt Presets
+                inp.as_posix(),
+                "--slice", "1",
+                "--export-3mf", str(out_3mf),
+                "--export-slicedata", str(out_meta),
+            ]
+            code5, out5, err5 = run(cmd5, timeout=900)
+            attempts.append({"tag": "try-5-ini", "cmd": " ".join(cmd5), "stderr_tail": (err5 or out5)[-800:]})
+            code, out, err = code5, out5, err5
 
         if code != 0:
             # gehärtete JSONs anhängen (gekürzt) → schnelle Diagnose
@@ -647,7 +731,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice 1). Settings via Semikolonliste; Conditions neutralisiert; optionaler Try-4."
+            "notes": "Gesliced mit festen Profilen (--slice 1). Fallback Try-5 lädt eine zusammengeführte .ini (kein Preset-Check)."
         }
     finally:
         try:
