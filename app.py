@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 
 # ------------------------------------------------------------
-# Pfad-Helfer
+# Pfade / Repo-Struktur
 # ------------------------------------------------------------
 REPO_DIR = Path("/app/profiles")
 
@@ -22,14 +22,17 @@ def _first_existing(*candidates: Path) -> Path:
             return p
     return candidates[0]
 
-PRINTER_FILE = _first_existing(REPO_DIR / "printer" / "X1C.json",
-                               REPO_DIR / "printers" / "X1C.json")
-PROCESS_FILE = _first_existing(REPO_DIR / "process" / "0.20mm_standard.json",
-                               REPO_DIR / "processes" / "0.20mm_standard.json")
-FILAMENT_DIR = _first_existing(REPO_DIR / "filament",
-                               REPO_DIR / "filaments")
-BUNDLE_FILE = REPO_DIR / "bundle_structure.json"
+PRINTER_FILE  = _first_existing(REPO_DIR / "printer"  / "X1C.json",
+                                REPO_DIR / "printers" / "X1C.json")
+PROCESS_FILE  = _first_existing(REPO_DIR / "process"  / "0.20mm_standard.json",
+                                REPO_DIR / "processes"/ "0.20mm_standard.json")
+FILAMENT_DIR  = _first_existing(REPO_DIR / "filament",
+                                REPO_DIR / "filaments")
+BUNDLE_FILE   = REPO_DIR / "bundle_structure.json"
 
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 def _choose_slicer_bin() -> Optional[str]:
     for p in ("/opt/orca/bin/orca-slicer", "/usr/local/bin/orca-slicer"):
         if Path(p).exists():
@@ -43,6 +46,12 @@ def _run(cmd: List[str]) -> Tuple[int, str, str]:
     except Exception as e:
         return 997, "", f"{type(e).__name__}: {e}"
 
+def _tail(s: str, n: int = 40) -> str:
+    if not s:
+        return ""
+    lines = s.splitlines()
+    return "\n".join(lines[-n:])
+
 def _read_json(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
@@ -51,19 +60,14 @@ def _write_json(path: Path, data: Dict):
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-def _tail(s: str, n: int = 24) -> str:
-    if not s:
-        return ""
-    lines = s.splitlines()
-    return "\n".join(lines[-n:])
-
 # ------------------------------------------------------------
-# Normalisierung & Binding
+# Normalisierung / Binding
 # ------------------------------------------------------------
 def _normalize_machine(machine: Dict) -> Dict:
+    """Bringt das Machine-Profil in CLI-kompatible Typen."""
     m = dict(machine)
 
-    # bed_shape: Liste von [x, y] floats (Strings wie "400x0" konvertieren)
+    # bed_shape als Float-Paare
     def _to_pair(v):
         if isinstance(v, str) and "x" in v:
             x, y = v.split("x")
@@ -72,6 +76,7 @@ def _normalize_machine(machine: Dict) -> Dict:
             return [float(v[0]), float(v[1])]
         return None
 
+    # printable_area -> bed_shape (falls nötig)
     if "printable_area" in m and not m.get("bed_shape"):
         fixed = []
         for p in m["printable_area"]:
@@ -90,101 +95,76 @@ def _normalize_machine(machine: Dict) -> Dict:
         if fixed:
             m["bed_shape"] = fixed
 
-    # Zahlenfelder erzwingen
-    for k in ("max_print_height", "min_layer_height", "max_layer_height"):
+    if not m.get("bed_shape"):
+        m["bed_shape"] = [[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]]
+
+    # Zahlen zu Strings, wie Orca sie in JSON erwartet
+    # extruders -> "1"
+    if "extruders" in m:
+        m["extruders"] = str(m["extruders"])
+    else:
+        m["extruders"] = "1"
+
+    # nozzle_diameter -> ["0.4"]
+    if "nozzle_diameter" in m:
+        nd = m["nozzle_diameter"]
+        if isinstance(nd, list):
+            m["nozzle_diameter"] = [str(x) for x in nd]
+        else:
+            m["nozzle_diameter"] = [str(nd)]
+    else:
+        m["nozzle_diameter"] = ["0.4"]
+
+    # max/min Layer height als String
+    for k, default in (("max_print_height", "300.0"),
+                       ("min_layer_height", "0.06"),
+                       ("max_layer_height", "0.30")):
         if k in m:
             try:
-                m[k] = float(m[k])
+                m[k] = f"{float(m[k]):.3f}"
             except Exception:
-                pass
+                m[k] = default
+        else:
+            m[k] = default
 
-    # extruders -> int
-    if "extruders" in m:
-        try:
-            m["extruders"] = int(m["extruders"])
-        except Exception:
-            pass
-    else:
-        m["extruders"] = 1
-
-    # nozzle_diameter -> Liste von floats
-    if "nozzle_diameter" in m and isinstance(m["nozzle_diameter"], list):
-        nd = []
-        for v in m["nozzle_diameter"]:
-            try:
-                nd.append(float(v))
-            except Exception:
-                continue
-        if nd:
-            m["nozzle_diameter"] = nd
-    elif "nozzle_diameter" in m:
-        try:
-            m["nozzle_diameter"] = [float(m["nozzle_diameter"])]
-        except Exception:
-            pass
-    else:
-        m["nozzle_diameter"] = [0.4]
-
-    # defaults
     m.setdefault("gcode_flavor", "marlin")
     m.setdefault("printer_technology", "FFF")
-    if not m.get("bed_shape"):
-        # Fallback: 200x200
-        m["bed_shape"] = [[0.0, 0.0], [200.0, 0.0], [200.0, 200.0], [0.0, 200.0]]
-    if "name" not in m:
-        # Notfalls aus model/variant zusammenstecken
-        nm = (m.get("printer_model") or "Generic 400x400")
-        var = (m.get("printer_variant") or "0.4")
-        m["name"] = f"{nm} {var} nozzle"
+
+    if not m.get("name"):
+        model = m.get("printer_model") or "Generic 400x400"
+        variant = m.get("printer_variant") or "0.4"
+        m["name"] = f"{model} {variant} nozzle"
 
     return m
 
 def _bind_compat(process: Dict, filament: Dict, machine: Dict) -> Tuple[Dict, Dict]:
-    """Bindet exakten Drucker-Namen und spiegelt relevante Felder."""
+    """Sorgt dafür, dass Prozess & Filament exakt zum Drucker passen – ohne heikle Felder zu duplizieren."""
     mname = machine.get("name", "")
-    bound_keys = {
-        "printer_technology": machine.get("printer_technology", "FFF"),
-        "printer_model": machine.get("printer_model", "Generic 400x400"),
-        "printer_variant": machine.get("printer_variant", "0.4"),
-        "gcode_flavor": machine.get("gcode_flavor", "marlin"),
-        "extruders": machine.get("extruders", 1),
-        "nozzle_diameter": machine.get("nozzle_diameter", [0.4]),
-    }
 
     def patch_preset(d: Dict) -> Dict:
         out = dict(d)
-        # kompatible_printers
-        lst = out.get("compatible_printers")
-        if not isinstance(lst, list):
-            lst = []
-        if mname not in lst:
-            lst = [mname] + [x for x in lst if x != mname]
-        out["compatible_printers"] = lst
+
+        # exakt nur dieser Printer in der Liste
+        out["compatible_printers"] = [mname]
         out.setdefault("compatible_printers_condition", "")
 
-        # Meta spiegeln
-        for k, v in bound_keys.items():
-            out[k] = v
-        # nozzle als floats
-        if isinstance(out.get("nozzle_diameter"), list):
-            out["nozzle_diameter"] = [float(x) for x in out["nozzle_diameter"]]
-        else:
-            try:
-                out["nozzle_diameter"] = [float(out["nozzle_diameter"])]
-            except Exception:
-                out["nozzle_diameter"] = [0.4]
-        try:
-            out["extruders"] = int(out.get("extruders", 1))
-        except Exception:
-            out["extruders"] = 1
+        # Heikle Felder entfernen (sie gehören ins Machine-Profil, und verursachten Typfehler)
+        for k in ("extruders", "nozzle_diameter"):
+            if k in out:
+                out.pop(k, None)
+
+        # optionale Meta (harmlos)
+        for k in ("printer_technology", "printer_model", "printer_variant", "gcode_flavor"):
+            if machine.get(k) is not None:
+                out[k] = machine[k]
         return out
 
     return patch_preset(process), patch_preset(filament)
 
 # ------------------------------------------------------------
-# FastAPI Grundgerüst
+# FastAPI
 # ------------------------------------------------------------
-app = FastAPI(title="Orca Cloud Helper", version="1.1.0")
+app = FastAPI(title="Orca Cloud Helper", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -242,7 +222,7 @@ async def slice_check(
     if not FILAMENT_DIR.exists():
         return JSONResponse(status_code=400, content={"detail": f"Filament-Ordner fehlt: {FILAMENT_DIR}"})
 
-    # Filament wählen (PLA bevorzugt)
+    # Filament-Datei auswählen (PLA bevorzugt)
     target = material.upper().strip()
     filament_file = None
     for f in FILAMENT_DIR.glob("*.json"):
@@ -250,7 +230,6 @@ async def slice_check(
             filament_file = f
             break
     if filament_file is None:
-        # Fallback erstes Profil
         filament_file = next(iter(FILAMENT_DIR.glob("*.json")), None)
     if filament_file is None:
         return JSONResponse(status_code=400, content={"detail": "Kein Filament-Profil gefunden"})
@@ -265,8 +244,8 @@ async def slice_check(
 
         # Profile laden
         try:
-            machine = _normalize_machine(_read_json(PRINTER_FILE))
-            process = _read_json(PROCESS_FILE)
+            machine  = _normalize_machine(_read_json(PRINTER_FILE))
+            process  = _read_json(PROCESS_FILE)
             filament = _read_json(filament_file)
         except Exception as e:
             return JSONResponse(status_code=400, content={"detail": f"Profil-Leseproblem: {type(e).__name__}: {e}"})
@@ -274,13 +253,14 @@ async def slice_check(
         printer_name = machine.get("name") or "Generic 400x400 0.4 nozzle"
         process, filament = _bind_compat(process, filament, machine)
 
-        # Benutzerwerte in den Process übernehmen
-        process["layer_height"] = str(layer_height)
-        process["first_layer_height"] = process.get("first_layer_height") or str(max(layer_height, 0.2))
+        # Benutzerwerte (als Strings) in Process
+        process["layer_height"] = f"{float(layer_height):.2f}"
+        process["first_layer_height"] = process.get("first_layer_height") or f"{max(float(layer_height), 0.2):.2f}"
         process["initial_layer_height"] = process.get("initial_layer_height") or process["first_layer_height"]
-        process["sparse_infill_density"] = f"{int(round(infill * 100))}%"
-        process["perimeter_extrusion_width"] = process.get("perimeter_extrusion_width") or str(nozzle + 0.05)
-        process["line_width"] = process.get("line_width") or str(nozzle + 0.05)
+        process["sparse_infill_density"] = f"{int(round(float(infill) * 100))}%"
+        # extrusionsbreite optional – aber als String
+        process.setdefault("perimeter_extrusion_width", f"{float(nozzle) + 0.05:.2f}")
+        process.setdefault("line_width", f"{float(nozzle) + 0.05:.2f}")
 
         # temporär schreiben
         mfile = tmp / "printer.json"
@@ -308,15 +288,12 @@ async def slice_check(
             "--export-slicedata", str(slicedata),
             "--export-settings", str(exported_settings),
         ]
-
         code, out, err = _run(cmd)
 
-        # Settings-Schnappschuss einlesen (falls entstanden)
         settings_tail = ""
         if exported_settings.exists():
             try:
-                with exported_settings.open("r", encoding="utf-8") as f:
-                    settings_tail = _tail(f.read(), 100)
+                settings_tail = _tail(exported_settings.read_text(encoding="utf-8"), 120)
             except Exception:
                 settings_tail = "(Konnte exportierte Settings nicht lesen)"
 
@@ -324,8 +301,8 @@ async def slice_check(
             "ok": code == 0,
             "code": code,
             "cmd": " ".join(cmd),
-            "stdout_tail": _tail(out, 60),
-            "stderr_tail": _tail(err, 60),
+            "stdout_tail": _tail(out, 80),
+            "stderr_tail": _tail(err, 80),
             "settings_tail": settings_tail,
             "profiles_used": {
                 "printer_name": printer_name,
@@ -334,12 +311,9 @@ async def slice_check(
                 "filament_path": str(filament_file),
             },
             "inputs": {
-                "unit": unit,
-                "material": material,
-                "infill": infill,
-                "layer_height": layer_height,
-                "nozzle": nozzle,
-                "stl_bytes": len(raw),
+                "unit": unit, "material": material,
+                "infill": infill, "layer_height": layer_height,
+                "nozzle": nozzle, "stl_bytes": len(raw),
             },
         }
 
@@ -351,31 +325,22 @@ async def slice_check(
             }
             return JSONResponse(content=resp, status_code=200)
 
-        # Spezielles Hilfspaket bei -17
         if code == 239 or code == -17:
             resp["hint"] = {
-                "summary": "process not compatible with printer – Orca lehnt die Kombination der Presets ab.",
-                "likely_causes": [
-                    "Der exakte Druckername fehlt in compatible_printers (wird jetzt hart hinzugefügt).",
-                    "Unpassende/inkonsistente Felder: nozzle_diameter (Typ/Liste), extruders, printer_model/variant.",
-                    "Zahlen als Strings (max_print_height, layer heights) → werden jetzt normalisiert.",
-                    "Bed-Shape war/ist nicht als Float-Paare vorhanden → wird konvertiert.",
-                ],
-                "what_we_bound": {
-                    "printer_name": printer_name,
-                    "copied_fields_into_process_and_filament": [
-                        "printer_technology", "printer_model", "printer_variant",
-                        "gcode_flavor", "extruders", "nozzle_diameter"
-                    ]
-                }
+                "summary": "process not compatible with printer",
+                "we_fixed_types": {
+                    "machine.extruders": machine.get("extruders"),
+                    "machine.nozzle_diameter": machine.get("nozzle_diameter"),
+                },
+                "we_removed_from_process_and_filament": ["extruders", "nozzle_diameter"],
+                "compatible_printers": process.get("compatible_printers"),
             }
             return JSONResponse(content={"detail": resp}, status_code=500)
 
-        # generischer Fehler
         return JSONResponse(content={"detail": resp}, status_code=500)
 
 # ------------------------------------------------------------
-# Mini-UI auf "/"
+# Mini-UI
 # ------------------------------------------------------------
 INDEX_HTML = """
 <!doctype html>
@@ -447,7 +412,6 @@ document.getElementById('sliceForm').addEventListener('submit', async (e)=>{
 def index():
     return HTMLResponse(content=INDEX_HTML)
 
-# Optionaler Alias
 @app.post("/slice")
 async def slice_alias(
     file: UploadFile = File(...),
