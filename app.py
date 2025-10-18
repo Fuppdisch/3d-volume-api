@@ -116,7 +116,7 @@ def parse_infill_to_pct(v) -> int:
 def ensure_known_good_jsons():
     KNOWN_GOOD_DIR.mkdir(parents=True, exist_ok=True)
     if not KG_MACHINE_JSON.exists():
-        # WICHTIG: "extruders" und "max_print_height" als STRINGS!
+        # WICHTIG: bed_shape als STRINGS "x"-getrennt; extruders & max_print_height als Strings
         KG_MACHINE_JSON.write_text(json.dumps({
             "type": "machine",
             "version": "1",
@@ -125,7 +125,7 @@ def ensure_known_good_jsons():
             "printer_model": "Generic 200",
             "printer_variant": "0.4",
             "printer_technology": "FFF",
-            "bed_shape": [[0,0],[200,0],[200,200],[0,200]],
+            "bed_shape": ["0x0", "200x0", "200x200", "0x200"],
             "max_print_height": "200",
             "extruders": "1",
             "nozzle_diameter": ["0.4"],
@@ -173,9 +173,21 @@ def ensure_known_good_jsons():
 # ------------------------------------------------------------------------------
 # JSON-Härtung (robustes Schema für Orca)
 # ------------------------------------------------------------------------------
+def _pts_to_strings(pts: List[List[float]]) -> List[str]:
+    out: List[str] = []
+    for xy in pts:
+        try:
+            x, y = float(xy[0]), float(xy[1])
+            sx = str(int(x)) if abs(x - int(x)) < 1e-9 else str(x)
+            sy = str(int(y)) if abs(y - int(y)) < 1e-9 else str(y)
+            out.append(f"{sx}x{sy}")
+        except:
+            pass
+    return out
+
 def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
     j = load_json(Path(src))
-    # Grundschema + Typen
+    # Pflichtfelder / Typen
     j["type"] = "machine"
     j["version"] = str(j.get("version", "1"))
     j["from"] = j.get("from", "user")
@@ -183,25 +195,31 @@ def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
     j.setdefault("printer_model", j["name"])
     j.setdefault("printer_variant", "0.4")
     j.setdefault("printer_technology", "FFF")
+    j.setdefault("gcode_flavor", "marlin")
 
-    # nozzle_diameter als Liste aus STRINGS
+    # nozzle_diameter als String-Liste
     nd = j.get("nozzle_diameter", ["0.4"])
     if isinstance(nd, list):
         j["nozzle_diameter"] = [str(x) for x in nd]
     else:
         j["nozzle_diameter"] = [str(nd)]
 
-    # extruders MUSS String sein
-    ext = j.get("extruders", "1")
-    j["extruders"] = str(ext)
+    # extruders als String
+    j["extruders"] = str(j.get("extruders", "1"))
 
-    # printable_area (Strings „0x0“) → bed_shape [[x,y],...]
-    if not j.get("bed_shape"):
+    # bed_shape: zu Stringliste normalisieren ("x"-getrennt)
+    bed_shape = j.get("bed_shape")
+    if isinstance(bed_shape, list) and bed_shape and isinstance(bed_shape[0], list):
+        j["bed_shape"] = _pts_to_strings(bed_shape)
+    elif isinstance(bed_shape, list) and bed_shape and isinstance(bed_shape[0], str):
+        j["bed_shape"] = [s.strip().replace(" ", "") for s in bed_shape]
+    else:
+        # aus printable_area ableiten oder Default
         pa = j.get("printable_area")
         pts: List[List[float]] = []
         if isinstance(pa, list):
             for s in pa:
-                s = str(s).lower().replace(" ", "")
+                s = str(s).strip().lower().replace(" ", "")
                 if "x" in s:
                     xs, ys = s.split("x", 1)
                     try:
@@ -209,18 +227,19 @@ def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
                     except:
                         pass
         if len(pts) >= 3:
-            j["bed_shape"] = pts[:4] if len(pts) >= 4 else pts + [pts[-1]]
+            j["bed_shape"] = _pts_to_strings(pts[:4] if len(pts) >= 4 else pts + [pts[-1]])
         else:
-            j["bed_shape"] = [[0,0],[400,0],[400,400],[0,400]]
-    j.pop("printable_area", None)
+            j["bed_shape"] = ["0x0", "400x0", "400x400", "0x400"]
+    j.pop("printable_area", None)  # altes Feld entfernen
 
-    # max_print_height MUSS String sein
+    # max_print_height als String
     mph = j.get("printable_height", j.get("max_print_height", "300"))
     try:
-        mph = str(float(mph)).rstrip("0").rstrip(".") if isinstance(mph, (int, float)) else str(mph)
+        if isinstance(mph, (int, float)):
+            mph = str(mph).rstrip("0").rstrip(".")
     except:
         mph = "300"
-    j["max_print_height"] = mph
+    j["max_print_height"] = str(mph)
     j.pop("printable_height", None)
 
     out = wd / "printer_hardened.json"
@@ -241,13 +260,18 @@ def harden_process_json(src: str, wd: Path, *, infill_pct: int, printer_name: st
     p["compatible_printers"] = list({*compat, "*", printer_name, base})
     p["compatible_printers_condition"] = ""
 
-    # sinnvolle Defaults, falls fehlen
+    # Sinnvolle Defaults
     p.setdefault("layer_height", "0.2")
     p.setdefault("initial_layer_height", "0.2")
     p.setdefault("line_width", "0.45")
     p.setdefault("perimeters", "2")
     p.setdefault("solid_layers", "3")
     p.setdefault("use_relative_e_distances", "0")
+
+    # Kontext (damit Orca weniger streng ist)
+    p.setdefault("printer_technology", "FFF")
+    p.setdefault("printer_model", printer_json.get("printer_model", "Generic"))
+    p.setdefault("printer_variant", printer_json.get("printer_variant", "0.4"))
 
     out = wd / "process_hardened.json"
     save_json(out, p)
@@ -664,3 +688,4 @@ async def estimate_time(
         }
     finally:
         shutil.rmtree(wd, ignore_errors=True)
+# ---------- /app.py ----------
