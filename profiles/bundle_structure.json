@@ -4,6 +4,6 @@
   "printer_config": ["printer/X1C.json"],
   "process_config": ["process/0.20mm_standard.json"],
   "filament_config": ["filament/PLA.json"],
-  "printer_preset_name": "X1C",
-  "version": ""
+  "printer_preset_name": "RatRig V-Core 4 400 0.4 nozzle",
+  "version": "1.0.0"
 }
