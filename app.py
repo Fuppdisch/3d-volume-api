@@ -547,7 +547,7 @@ async def estimate_time(
         synth_path = work / "process_synthetic.json"
         save_json(synth_path, process_synth)
 
-        # ---------- CLI-Kommandos (getrennte --load-settings, --slice ohne Argument) ----------
+        # ---------- CLI-Kommandos (getrennte --load-settings, --slice "1") ----------
         def base_cmd(load_proc: str) -> List[str]:
             return [
                 SLICER_BIN,
@@ -558,7 +558,7 @@ async def estimate_time(
                 "--load-filaments", str(hardened_filament),
                 "--export-slicedata", str(out_meta),
                 inp.as_posix(),
-                "--slice",                 # ← kein "0"
+                "--slice", "1",          # ✅ explizit 1
                 "--export-3mf", str(out_3mf),
             ]
 
@@ -579,7 +579,7 @@ async def estimate_time(
                 "--load-settings", str(hardened_process),
                 "--load-filaments", str(hardened_filament),
                 inp.as_posix(),
-                "--slice",              # ← ohne Argument
+                "--slice", "1",          # ✅ explizit 1
                 "--export-3mf", str(out_3mf),
                 "--export-slicedata", str(out_meta),
             ]
@@ -631,7 +631,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--slice). Kompatibilität erzwungen; getrennte --load-settings."
+            "notes": "Gesliced mit festen Profilen (--slice 1). Kompatibilität erzwungen; getrennte --load-settings."
         }
     finally:
         try:
