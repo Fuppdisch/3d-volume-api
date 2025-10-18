@@ -3,7 +3,7 @@ import os, io, json, time, hashlib, zipfile, shutil, tempfile, subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -32,16 +32,13 @@ SLICER_BIN = (
     or "/usr/local/bin/orca-slicer"
 )
 
-# JSON-first
-JSON_FIRST = True
-
 # known-good JSON Dateien (statt INI)
 KNOWN_GOOD_DIR = Path("/app/profiles/_known_good")
 KG_MACHINE_JSON  = KNOWN_GOOD_DIR / "machine.json"
 KG_PROCESS_JSON  = KNOWN_GOOD_DIR / "process.json"
 KG_FILAMENT_JSON = KNOWN_GOOD_DIR / "filament.json"
 
-# Headless
+# Headless-Defaults
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("XDG_RUNTIME_DIR", "/tmp")
 os.environ.setdefault("LD_LIBRARY_PATH", "/opt/orca/usr/lib:/opt/orca/lib:" + os.environ.get("LD_LIBRARY_PATH", ""))
@@ -100,7 +97,7 @@ def load_json(p: Path) -> dict:
     return json.loads(p.read_text(encoding="utf-8"))
 
 def save_json(p: Path, obj: dict):
-    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def parse_infill_to_pct(v) -> int:
     if v is None: return 35
@@ -114,11 +111,12 @@ def parse_infill_to_pct(v) -> int:
     return int(round(max(0.0, min(100.0, x))))
 
 # ------------------------------------------------------------------------------
-# known-good JSONs sicherstellen
+# known-good JSONs sicherstellen (Typen so, wie Orca sie erwartet)
 # ------------------------------------------------------------------------------
 def ensure_known_good_jsons():
     KNOWN_GOOD_DIR.mkdir(parents=True, exist_ok=True)
     if not KG_MACHINE_JSON.exists():
+        # WICHTIG: "extruders" und "max_print_height" als STRINGS!
         KG_MACHINE_JSON.write_text(json.dumps({
             "type": "machine",
             "version": "1",
@@ -127,11 +125,10 @@ def ensure_known_good_jsons():
             "printer_model": "Generic 200",
             "printer_variant": "0.4",
             "printer_technology": "FFF",
-            # WICHTIG: bed_shape als Koordinatenpaare!
             "bed_shape": [[0,0],[200,0],[200,200],[0,200]],
-            "max_print_height": 200,
+            "max_print_height": "200",
+            "extruders": "1",
             "nozzle_diameter": ["0.4"],
-            "extruders": 1,
             "gcode_flavor": "marlin"
         }, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -178,22 +175,27 @@ def ensure_known_good_jsons():
 # ------------------------------------------------------------------------------
 def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
     j = load_json(Path(src))
+    # Grundschema + Typen
     j["type"] = "machine"
     j["version"] = str(j.get("version", "1"))
-    j["from"] = j.get("from","user")
+    j["from"] = j.get("from", "user")
     j.setdefault("name", Path(src).stem)
     j.setdefault("printer_model", j["name"])
     j.setdefault("printer_variant", "0.4")
     j.setdefault("printer_technology", "FFF")
 
-    # nozzle_diameter als Liste aus Strings
+    # nozzle_diameter als Liste aus STRINGS
     nd = j.get("nozzle_diameter", ["0.4"])
     if isinstance(nd, list):
         j["nozzle_diameter"] = [str(x) for x in nd]
     else:
         j["nozzle_diameter"] = [str(nd)]
 
-    # printable_area (Strings wie "0x0") → bed_shape ([[x,y],...])
+    # extruders MUSS String sein
+    ext = j.get("extruders", "1")
+    j["extruders"] = str(ext)
+
+    # printable_area (Strings „0x0“) → bed_shape [[x,y],...]
     if not j.get("bed_shape"):
         pa = j.get("printable_area")
         pts: List[List[float]] = []
@@ -212,11 +214,13 @@ def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
             j["bed_shape"] = [[0,0],[400,0],[400,400],[0,400]]
     j.pop("printable_area", None)
 
-    # Höhenwert normalisieren
+    # max_print_height MUSS String sein
+    mph = j.get("printable_height", j.get("max_print_height", "300"))
     try:
-        j["max_print_height"] = float(j.get("printable_height", j.get("max_print_height", 300)))
+        mph = str(float(mph)).rstrip("0").rstrip(".") if isinstance(mph, (int, float)) else str(mph)
     except:
-        j["max_print_height"] = 300
+        mph = "300"
+    j["max_print_height"] = mph
     j.pop("printable_height", None)
 
     out = wd / "printer_hardened.json"
@@ -235,15 +239,15 @@ def harden_process_json(src: str, wd: Path, *, infill_pct: int, printer_name: st
     compat = p.get("compatible_printers", [])
     if not isinstance(compat, list): compat = []
     p["compatible_printers"] = list({*compat, "*", printer_name, base})
+    p["compatible_printers_condition"] = ""
 
-    # Defaults, falls fehlen
+    # sinnvolle Defaults, falls fehlen
     p.setdefault("layer_height", "0.2")
     p.setdefault("initial_layer_height", "0.2")
     p.setdefault("line_width", "0.45")
     p.setdefault("perimeters", "2")
     p.setdefault("solid_layers", "3")
     p.setdefault("use_relative_e_distances", "0")
-    p["compatible_printers_condition"] = ""
 
     out = wd / "process_hardened.json"
     save_json(out, p)
@@ -327,7 +331,7 @@ def parse_slicedata_folder(folder: Path) -> Dict[str, Any]:
     return out
 
 # ------------------------------------------------------------------------------
-# UI
+# Mini-UI
 # ------------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -432,7 +436,6 @@ def preset_dump():
             except Exception as e:
                 s = f"ERR: {e}"
             out[k].append({"file": p, "sample": s[:2000]})
-    # known good vorhanden?
     ensure_known_good_jsons()
     out["known_good_present"] = {
         "printer": KG_MACHINE_JSON.exists(),
@@ -465,7 +468,7 @@ async def analyze_upload(file: UploadFile = File(...)):
 # ------------------------------------------------------------------------------
 @app.get("/selftest", response_class=JSONResponse)
 def selftest():
-    # Mini-Würfel (10 mm) – sehr klein/sauber
+    # sehr kleiner Würfel (10mm) als STL
     CUBE_STL = b"""
 solid cube
 facet normal 0 0 -1
