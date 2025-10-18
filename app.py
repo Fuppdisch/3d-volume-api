@@ -545,7 +545,7 @@ async def estimate_time(
         save_json(synth_path, process_synth)
 
         # ---------- CLI-Kommandos ----------
-        # Ein --load-settings mit Semikolonliste + Orient/Arrange + Slice 1
+        # Ein --load-settings mit Semikolonliste, --slice 1, ohne --orient/--arrange
         def base_cmd(load_proc: str) -> List[str]:
             load_list = f"{hardened_printer};{load_proc}"
             return [
@@ -555,8 +555,6 @@ async def estimate_time(
                 "--load-settings", load_list,
                 "--load-filaments", str(hardened_filament),
                 "--export-slicedata", str(out_meta),
-                "--orient",
-                "--arrange", "1",
                 inp.as_posix(),
                 "--slice", "1",
                 "--export-3mf", str(out_3mf),
@@ -576,7 +574,6 @@ async def estimate_time(
                 "--datadir", str(datadir),
                 "--load-settings", f"{hardened_printer};{hardened_process}",
                 "--load-filaments", str(hardened_filament),
-                "--orient", "--arrange", "1",
                 inp.as_posix(),
                 "--slice", "1",
                 "--export-3mf", str(out_3mf),
@@ -592,6 +589,23 @@ async def estimate_time(
             code3, out3, err3 = run(cmd3, timeout=900)
             attempts.append({"tag": "try-3", "cmd": " ".join(cmd3), "stderr_tail": (err3 or out3)[-800:]})
             code, out, err = code3, out3, err3
+
+        # Versuch 4 (optional): getrennte --load-settings
+        if code != 0:
+            cmd4 = [XVFB, "-a"] + [
+                SLICER_BIN, "--debug", str(int(debug) if isinstance(debug, int) else 0),
+                "--datadir", str(datadir),
+                "--load-settings", str(hardened_printer),
+                "--load-settings", str(hardened_process),
+                "--load-filaments", str(hardened_filament),
+                inp.as_posix(),
+                "--slice", "1",
+                "--export-3mf", str(out_3mf),
+                "--export-slicedata", str(out_meta),
+            ]
+            code4, out4, err4 = run(cmd4, timeout=900)
+            attempts.append({"tag": "try-4", "cmd": " ".join(cmd4), "stderr_tail": (err4 or out4)[-800:]})
+            code, out, err = code4, out4, err4
 
         if code != 0:
             # gehärtete JSONs anhängen (gekürzt) → schnelle Diagnose
@@ -630,7 +644,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": "Gesliced mit festen Profilen (--orient, --arrange 1, --slice 1). Settings via Semikolonliste geladen."
+            "notes": "Gesliced mit festen Profilen (--slice 1). Settings via Semikolonliste, optionaler Try-4 mit getrennten --load-settings."
         }
     finally:
         try:
