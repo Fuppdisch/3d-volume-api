@@ -32,14 +32,14 @@ SLICER_BIN = (
     or "/usr/local/bin/orca-slicer"
 )
 
-# INI-first bevorzugen
-INI_FIRST = True
+# JSON-first
+JSON_FIRST = True
 
-# Bekannte gute Minimal-INIs (als Notanker)
+# known-good JSON Dateien (statt INI)
 KNOWN_GOOD_DIR = Path("/app/profiles/_known_good")
-KNOWN_GOOD_PRINTER_INI  = KNOWN_GOOD_DIR / "printer.ini"
-KNOWN_GOOD_PROCESS_INI  = KNOWN_GOOD_DIR / "process.ini"
-KNOWN_GOOD_FILAMENT_INI = KNOWN_GOOD_DIR / "filament.ini"
+KG_MACHINE_JSON  = KNOWN_GOOD_DIR / "machine.json"
+KG_PROCESS_JSON  = KNOWN_GOOD_DIR / "process.json"
+KG_FILAMENT_JSON = KNOWN_GOOD_DIR / "filament.json"
 
 # Headless
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -114,142 +114,150 @@ def parse_infill_to_pct(v) -> int:
     return int(round(max(0.0, min(100.0, x))))
 
 # ------------------------------------------------------------------------------
-# JSON → INI: flache, kompatible Configs erzeugen
+# known-good JSONs sicherstellen
 # ------------------------------------------------------------------------------
-def to_bed_shape_polygon(printer_json: dict) -> str:
-    area = printer_json.get("printable_area")
-    if isinstance(area, list) and len(area) >= 3:
-        pts = []
-        for e in area:
-            s = str(e).lower().replace(" ", "")
-            if "x" in s:
-                pts.append(s)
-        if len(pts) >= 3:
-            return ",".join(pts[:4] if len(pts) >= 4 else pts + [pts[-1]])
-    # Fallback: Quadrat 400x400
-    return "0x0,400x0,400x400,0x400"
+def ensure_known_good_jsons():
+    KNOWN_GOOD_DIR.mkdir(parents=True, exist_ok=True)
+    if not KG_MACHINE_JSON.exists():
+        KG_MACHINE_JSON.write_text(json.dumps({
+            "type": "machine",
+            "version": "1",
+            "from": "user",
+            "name": "Generic 200x200 0.4 nozzle",
+            "printer_model": "Generic 200",
+            "printer_variant": "0.4",
+            "printer_technology": "FFF",
+            # WICHTIG: bed_shape als Koordinatenpaare!
+            "bed_shape": [[0,0],[200,0],[200,200],[0,200]],
+            "max_print_height": 200,
+            "nozzle_diameter": ["0.4"],
+            "extruders": 1,
+            "gcode_flavor": "marlin"
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def first_num(val, default: float) -> float:
-    if isinstance(val, list) and val:
-        try: return float(val[0])
-        except: return default
-    try: return float(val)
-    except: return default
+    if not KG_PROCESS_JSON.exists():
+        KG_PROCESS_JSON.write_text(json.dumps({
+            "type": "process",
+            "version": "1",
+            "from": "user",
+            "name": "KnownGood 0.2mm",
+            "layer_height": "0.2",
+            "initial_layer_height": "0.2",
+            "line_width": "0.45",
+            "perimeters": "2",
+            "solid_layers": "3",
+            "z_seam_type": "aligned",
+            "use_relative_e_distances": "0",
+            "external_perimeter_speed": "60",
+            "perimeter_speed": "60",
+            "infill_speed": "90",
+            "travel_speed": "120",
+            "sparse_infill_density": "10%",
+            "compatible_printers": ["*", "Generic 200x200 0.4 nozzle"],
+            "compatible_printers_condition": ""
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def write_printer_ini(printer_json: dict, dst: Path) -> Path:
-    nozzle = printer_json.get("nozzle_diameter") or ["0.4"]
-    nozzle_str = ",".join(str(x) for x in nozzle) if isinstance(nozzle, list) else str(nozzle)
-    max_h = printer_json.get("printable_height") or 300
-    ini = [
-        f"bed_shape = {to_bed_shape_polygon(printer_json)}",
-        f"max_print_height = {first_num(max_h, 300)}",
-        f"nozzle_diameter = {nozzle_str}",
-        "extruders = 1",
-        "printer_technology = FFF",
-        "gcode_flavor = marlin",
-        "use_firmware_retraction = 0",
-    ]
-    dst.write_text("\n".join(ini) + "\n", encoding="utf-8")
-    return dst
-
-def write_process_ini(process_json: dict, infill_pct: int, dst: Path) -> Path:
-    lh  = process_json.get("layer_height") or "0.2"
-    flh = process_json.get("initial_layer_height") or process_json.get("first_layer_height") or "0.3"
-    lw  = process_json.get("line_width") or "0.45"
-    ow  = process_json.get("outer_wall_speed") or "60"
-    iw  = process_json.get("inner_wall_speed") or "80"
-    travel = process_json.get("travel_speed") or "120"
-    rel_e = process_json.get("use_relative_e_distances", "0")
-    ini = [
-        f"layer_height = {lh}",
-        f"first_layer_height = {flh}",
-        f"fill_density = {int(max(0, min(100, infill_pct)))}",
-        f"perimeter_extrusion_width = {lw}",
-        f"external_perimeter_extrusion_width = {lw}",
-        f"infill_extrusion_width = {lw}",
-        f"perimeter_speed = {ow}",
-        f"external_perimeter_speed = {ow}",
-        f"infill_speed = {iw}",
-        f"travel_speed = {travel}",
-        f"use_relative_e_distances = {rel_e}",
-        "perimeters = 2",
-        "solid_layers = 4",
-        "top_solid_layers = 4",
-        "bottom_solid_layers = 4",
-        "avoid_crossing_perimeters = 1",
-        "z_seam_type = aligned",
-    ]
-    dst.write_text("\n".join(ini) + "\n", encoding="utf-8")
-    return dst
-
-def write_filament_ini(filament_json: dict, dst: Path) -> Path:
-    noz      = filament_json.get("nozzle_temperature") or ["200"]
-    noz0     = filament_json.get("nozzle_temperature_initial_layer") or [noz[0] if isinstance(noz, list) and noz else "205"]
-    bed      = filament_json.get("bed_temperature") or ["0"]
-    bed0     = filament_json.get("bed_temperature_initial_layer") or bed
-    dia      = filament_json.get("filament_diameter") or ["1.75"]
-    density  = filament_json.get("filament_density") or ["1.25"]  # g/cm³
-    flow     = filament_json.get("filament_flow_ratio") or ["1.0"]
-
-    def first_str(v, dft="0"):
-        if isinstance(v, list) and v: return str(v[0])
-        if isinstance(v, (int, float)): return str(v)
-        if isinstance(v, str): return v
-        return dft
-
-    ini = [
-        f"temperature = {first_str(noz, '200')}",
-        f"first_layer_temperature = {first_str(noz0, '205')}",
-        f"bed_temperature = {first_str(bed, '0')}",
-        f"first_layer_bed_temperature = {first_str(bed0, '0')}",
-        f"filament_diameter = {first_str(dia, '1.75')}",
-        f"filament_density = {first_str(density, '1.25')}",
-        f"filament_flow_ratio = {first_str(flow, '1.0')}",
-    ]
-    dst.write_text("\n".join(ini) + "\n", encoding="utf-8")
-    return dst
+    if not KG_FILAMENT_JSON.exists():
+        KG_FILAMENT_JSON.write_text(json.dumps({
+            "type": "filament",
+            "from": "user",
+            "name": "KnownGood PLA",
+            "filament_diameter": ["1.75"],
+            "filament_density": ["1.25"],
+            "filament_flow_ratio": ["1.0"],
+            "nozzle_temperature": ["200"],
+            "nozzle_temperature_initial_layer": ["205"],
+            "bed_temperature": ["0"],
+            "first_layer_bed_temperature": ["0"],
+            "compatible_printers": ["*"],
+            "compatible_printers_condition": ""
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ------------------------------------------------------------------------------
-# JSON-Härtung (nur Fallback)
+# JSON-Härtung (robustes Schema für Orca)
 # ------------------------------------------------------------------------------
 def harden_printer_json(src: str, wd: Path) -> Tuple[str, dict, str]:
     j = load_json(Path(src))
     j["type"] = "machine"
-    nd = j.get("nozzle_diameter")
-    if isinstance(nd, list): j["nozzle_diameter"] = [str(x) for x in nd]
-    elif nd is not None:    j["nozzle_diameter"] = [str(nd)]
+    j["version"] = str(j.get("version", "1"))
+    j["from"] = j.get("from","user")
     j.setdefault("name", Path(src).stem)
-    j.setdefault("printer_model", j["name"].split(" 0.")[0])
+    j.setdefault("printer_model", j["name"])
     j.setdefault("printer_variant", "0.4")
     j.setdefault("printer_technology", "FFF")
-    if "version" in j and not isinstance(j["version"], str): j["version"] = str(j["version"])
-    out = wd / "printer_hardened.json"; save_json(out, j); return str(out), j, j["name"]
+
+    # nozzle_diameter als Liste aus Strings
+    nd = j.get("nozzle_diameter", ["0.4"])
+    if isinstance(nd, list):
+        j["nozzle_diameter"] = [str(x) for x in nd]
+    else:
+        j["nozzle_diameter"] = [str(nd)]
+
+    # printable_area (Strings wie "0x0") → bed_shape ([[x,y],...])
+    if not j.get("bed_shape"):
+        pa = j.get("printable_area")
+        pts: List[List[float]] = []
+        if isinstance(pa, list):
+            for s in pa:
+                s = str(s).lower().replace(" ", "")
+                if "x" in s:
+                    xs, ys = s.split("x", 1)
+                    try:
+                        pts.append([float(xs), float(ys)])
+                    except:
+                        pass
+        if len(pts) >= 3:
+            j["bed_shape"] = pts[:4] if len(pts) >= 4 else pts + [pts[-1]]
+        else:
+            j["bed_shape"] = [[0,0],[400,0],[400,400],[0,400]]
+    j.pop("printable_area", None)
+
+    # Höhenwert normalisieren
+    try:
+        j["max_print_height"] = float(j.get("printable_height", j.get("max_print_height", 300)))
+    except:
+        j["max_print_height"] = 300
+    j.pop("printable_height", None)
+
+    out = wd / "printer_hardened.json"
+    save_json(out, j)
+    return str(out), j, j["name"]
 
 def harden_process_json(src: str, wd: Path, *, infill_pct: int, printer_name: str, printer_json: dict) -> Tuple[str, dict]:
     p = load_json(Path(src))
-    p["type"] = "process"; p.setdefault("version", "1")
-    if not isinstance(p["version"], str): p["version"] = str(p["version"])
-    p.pop("fill_density", None)
-    p["sparse_infill_density"] = f"{int(max(0, min(100, infill_pct)))}%"
-    p["before_layer_gcode"] = (p.get("before_layer_gcode") or "").replace("G92 E0", "")
-    # Harter Match
-    p["printer_technology"] = "FFF"
-    p["printer_model"] = printer_json.get("printer_model") or printer_name
-    p["printer_variant"] = printer_json.get("printer_variant") or "0.4"
-    p["nozzle_diameter"] = printer_json.get("nozzle_diameter") or ["0.4"]
-    compat = p.get("compatible_printers")
-    if not isinstance(compat, list): compat = []
+    p["type"] = "process"
+    p["version"] = str(p.get("version","1"))
+    p["from"] = p.get("from","user")
+    p["sparse_infill_density"] = f"{int(max(0,min(100,infill_pct)))}%"
+
+    # Kompatibilität robust setzen
     base = printer_name.split(" (")[0].strip()
-    p["compatible_printers"] = list({*([x for x in compat if isinstance(x, str)]), "*", printer_name, base})
+    compat = p.get("compatible_printers", [])
+    if not isinstance(compat, list): compat = []
+    p["compatible_printers"] = list({*compat, "*", printer_name, base})
+
+    # Defaults, falls fehlen
+    p.setdefault("layer_height", "0.2")
+    p.setdefault("initial_layer_height", "0.2")
+    p.setdefault("line_width", "0.45")
+    p.setdefault("perimeters", "2")
+    p.setdefault("solid_layers", "3")
+    p.setdefault("use_relative_e_distances", "0")
     p["compatible_printers_condition"] = ""
-    out = wd / "process_hardened.json"; save_json(out, p); return str(out), p
+
+    out = wd / "process_hardened.json"
+    save_json(out, p)
+    return str(out), p
 
 def harden_filament_json(src: str, wd: Path) -> Tuple[str, dict]:
     f = load_json(Path(src))
     f["type"] = "filament"
     if "version" in f and not isinstance(f["version"], str): f["version"] = str(f["version"])
+    # breit kompatibel
     f["compatible_printers"] = ["*"]; f["compatible_printers_condition"] = ""
-    out = wd / "filament_hardened.json"; save_json(out, f); return str(out), f
+    out = wd / "filament_hardened.json"
+    save_json(out, f)
+    return str(out), f
 
 # ------------------------------------------------------------------------------
 # Analyse (STL/3MF)
@@ -363,9 +371,10 @@ small{color:var(--muted)}</style>
       <div style="margin:8px 0"><label>Printer-Profil</label><input name="printer_profile" placeholder="optional: Dateiname"></div>
       <div style="margin:8px 0"><label>Process-Profil</label><input name="process_profile" placeholder="optional: Dateiname"></div>
       <div style="margin:8px 0"><label>Filament-Profil</label><input name="filament_profile" placeholder="optional: Dateiname"></div>
-      <div style="margin:8px 0"><label>Known-good</label><input name="force_known_good" type="checkbox" value="1"></div>
+      <div style="margin:8px 0"><label>no-check</label><input name="no_check" type="checkbox" value="1"></div>
+      <div style="margin:8px 0"><label>Matrix</label><input name="matrix" type="checkbox" value="1"><small> Varianten-Report</small></div>
       <input type="submit" value="Zeit ermitteln">
-      <div><small>INI-first (Preset-Checks umgangen), JSON-Fallback bei Bedarf.</small></div>
+      <div><small>JSON-first, gehärtete Presets; Selftest nutzt known-good JSON.</small></div>
     </form>
   </div>
 </div>
@@ -397,8 +406,7 @@ def slicer_env():
     try:
         code, out, err = run([which, "--help"], timeout=8)
         info["return_code"] = code
-        info["help_snippet"] = (out or err or "")[:2000]  # größerer Ausschnitt hilft
-        # Version, falls unterstützt
+        info["help_snippet"] = (out or err or "")[:2000]
         try:
             vcode, vout, verr = run([which, "--version"], timeout=4)
             info["version"] = (vout or verr or "").strip()
@@ -425,10 +433,11 @@ def preset_dump():
                 s = f"ERR: {e}"
             out[k].append({"file": p, "sample": s[:2000]})
     # known good vorhanden?
+    ensure_known_good_jsons()
     out["known_good_present"] = {
-        "printer": KNOWN_GOOD_PRINTER_INI.exists(),
-        "process": KNOWN_GOOD_PROCESS_INI.exists(),
-        "filament": KNOWN_GOOD_FILAMENT_INI.exists(),
+        "printer": KG_MACHINE_JSON.exists(),
+        "process": KG_PROCESS_JSON.exists(),
+        "filament": KG_FILAMENT_JSON.exists(),
     }
     return out
 
@@ -452,11 +461,11 @@ async def analyze_upload(file: UploadFile = File(...)):
         raise HTTPException(500, f"Analyse fehlgeschlagen: {e}")
 
 # ------------------------------------------------------------------------------
-# Selftest (End-zu-Ende)
+# Selftest (End-zu-Ende, JSON known-good)
 # ------------------------------------------------------------------------------
 @app.get("/selftest", response_class=JSONResponse)
 def selftest():
-    # Mini-Würfel (10 mm) – absichtlich sehr klein/sauber
+    # Mini-Würfel (10 mm) – sehr klein/sauber
     CUBE_STL = b"""
 solid cube
 facet normal 0 0 -1
@@ -479,6 +488,8 @@ endsolid
     if not slicer_exists():
         return {"ok": False, "error": "Slicer nicht gefunden", "slicer_bin": SLICER_BIN}
 
+    ensure_known_good_jsons()
+
     wd = Path(tempfile.mkdtemp(prefix="selftest_"))
     try:
         inp = wd / "cube.stl"; inp.write_bytes(CUBE_STL)
@@ -486,43 +497,34 @@ endsolid
         out_3mf  = wd / "out.3mf"
         datadir  = wd / "cfg"; datadir.mkdir(exist_ok=True)
 
-        # Known-good INIs (lokal erzeugen, falls nicht vorhanden)
-        if not KNOWN_GOOD_DIR.exists():
-            KNOWN_GOOD_DIR.mkdir(parents=True, exist_ok=True)
-        if not KNOWN_GOOD_PRINTER_INI.exists():
-            KNOWN_GOOD_PRINTER_INI.write_text("bed_shape = 0x0,200x0,200x200,0x200\nmax_print_height = 200\nnozzle_diameter = 0.4\nextruders = 1\nprinter_technology = FFF\ngcode_flavor = marlin\n", encoding="utf-8")
-        if not KNOWN_GOOD_PROCESS_INI.exists():
-            KNOWN_GOOD_PROCESS_INI.write_text("layer_height = 0.2\nfirst_layer_height = 0.2\nfill_density = 10\nperimeter_extrusion_width = 0.45\nexternal_perimeter_extrusion_width = 0.45\ninfill_extrusion_width = 0.45\nperimeters = 2\nsolid_layers = 3\nz_seam_type = aligned\nuse_relative_e_distances = 0\ntravel_speed = 120\n", encoding="utf-8")
-        if not KNOWN_GOOD_FILAMENT_INI.exists():
-            KNOWN_GOOD_FILAMENT_INI.write_text("temperature = 200\nfirst_layer_temperature = 205\nbed_temperature = 0\nfirst_layer_bed_temperature = 0\nfilament_diameter = 1.75\nfilament_density = 1.25\nfilament_flow_ratio = 1.0\n", encoding="utf-8")
-
         attempts = []
 
-        # Try-INI 1
+        # Try JSON (join)
         cmd1 = [XVFB, "-a", which, "--debug", "1", "--datadir", str(datadir),
-                "--load-settings", f"{KNOWN_GOOD_PRINTER_INI};{KNOWN_GOOD_PROCESS_INI}",
-                "--load-filaments", str(KNOWN_GOOD_FILAMENT_INI),
+                "--load-settings", f"{KG_MACHINE_JSON};{KG_PROCESS_JSON}",
+                "--load-filaments", str(KG_FILAMENT_JSON),
                 "--export-slicedata", str(out_meta),
                 str(inp), "--slice", "1", "--export-3mf", str(out_3mf)]
         c1, o1, e1 = run(cmd1, timeout=300)
-        attempts.append({"try":"ini-1","code":c1,"stderr_tail":(e1 or o1)[-2000:], "cmd":" ".join(cmd1)})
+        attempts.append({"try":"json-1-join","code":c1,"stderr_tail":(e1 or o1)[-2000:], "cmd":" ".join(cmd1)})
 
         if c1 != 0:
+            # Try JSON (split)
             cmd2 = [XVFB, "-a", which, "--debug", "1", "--datadir", str(datadir),
-                    "--load-settings", str(KNOWN_GOOD_PRINTER_INI),
-                    "--load-settings", str(KNOWN_GOOD_PROCESS_INI),
-                    "--load-filaments", str(KNOWN_GOOD_FILAMENT_INI),
+                    "--load-settings", str(KG_MACHINE_JSON),
+                    "--load-settings", str(KG_PROCESS_JSON),
+                    "--load-filaments", str(KG_FILAMENT_JSON),
                     str(inp), "--slice", "1", "--export-3mf", str(out_3mf),
                     "--export-slicedata", str(out_meta)]
             c2, o2, e2 = run(cmd2, timeout=300)
-            attempts.append({"try":"ini-2-split","code":c2,"stderr_tail":(e2 or o2)[-2000:], "cmd":" ".join(cmd2)})
+            attempts.append({"try":"json-2-split","code":c2,"stderr_tail":(e2 or o2)[-2000:], "cmd":" ".join(cmd2)})
         else:
             c2 = 0
 
-        ok_ini = (c1 == 0) or (c2 == 0)
-        result = {"ok": ok_ini, "attempts": attempts}
+        ok = (c1 == 0) or (c2 == 0)
+        result = {"ok": ok, "attempts": attempts}
 
-        if ok_ini:
+        if ok:
             meta = parse_slicedata_folder(out_meta)
             result["duration_s"] = meta.get("duration_s")
             result["filament_mm"] = meta.get("filament_mm")
@@ -532,7 +534,7 @@ endsolid
         shutil.rmtree(wd, ignore_errors=True)
 
 # ------------------------------------------------------------------------------
-# Slicing / Zeitabschätzung
+# Slicing / Zeitabschätzung (JSON-first)
 # ------------------------------------------------------------------------------
 @app.post("/estimate_time", response_class=JSONResponse)
 async def estimate_time(
@@ -543,8 +545,8 @@ async def estimate_time(
     material: str = Form("PLA"),
     infill: str = Form("0.35"),
     debug: int = Form(0),
-    force_known_good: int = Form(0),
-    matrix: int = Query(0, description="Wenn 1: testet mehrere Slicing-Varianten und liefert die Matrix zurück."),
+    no_check: int = Form(0),
+    matrix: int = Form(0),
 ):
     if not slicer_exists():
         raise HTTPException(500, "OrcaSlicer CLI nicht verfügbar.")
@@ -581,29 +583,7 @@ async def estimate_time(
 
         which = shutil.which(os.path.basename(SLICER_BIN)) or SLICER_BIN
 
-        # INI Pfad vorbereiten
-        if force_known_good:
-            printer_ini  = KNOWN_GOOD_PRINTER_INI
-            process_ini  = KNOWN_GOOD_PROCESS_INI
-            filament_ini = KNOWN_GOOD_FILAMENT_INI
-            # Falls nicht vorhanden: generieren (wie bei /selftest)
-            if not KNOWN_GOOD_PRINTER_INI.exists():
-                KNOWN_GOOD_DIR.mkdir(parents=True, exist_ok=True)
-                KNOWN_GOOD_PRINTER_INI.write_text("bed_shape = 0x0,200x0,200x200,0x200\nmax_print_height = 200\nnozzle_diameter = 0.4\nextruders = 1\nprinter_technology = FFF\ngcode_flavor = marlin\n", encoding="utf-8")
-            if not KNOWN_GOOD_PROCESS_INI.exists():
-                KNOWN_GOOD_PROCESS_INI.write_text("layer_height = 0.2\nfirst_layer_height = 0.2\nfill_density = 10\nperimeter_extrusion_width = 0.45\nexternal_perimeter_extrusion_width = 0.45\ninfill_extrusion_width = 0.45\nperimeters = 2\nsolid_layers = 3\nz_seam_type = aligned\nuse_relative_e_distances = 0\ntravel_speed = 120\n", encoding="utf-8")
-            if not KNOWN_GOOD_FILAMENT_INI.exists():
-                KNOWN_GOOD_FILAMENT_INI.write_text("temperature = 200\nfirst_layer_temperature = 205\nbed_temperature = 0\nfirst_layer_bed_temperature = 0\nfilament_diameter = 1.75\nfilament_density = 1.25\nfilament_flow_ratio = 1.0\n", encoding="utf-8")
-        else:
-            # Eigene JSON → INI
-            printer_json  = load_json(Path(pick_printer))
-            process_json0 = load_json(Path(pick_process0))
-            filament_json = load_json(Path(pick_filament))
-            printer_ini  = write_printer_ini(printer_json,  wd / "printer.ini")
-            process_ini  = write_process_ini(process_json0, pct, wd / "process.ini")
-            filament_ini = write_filament_ini(filament_json, wd / "filament.ini")
-
-        # Gehärtete JSONs (nur Fallback)
+        # Gehärtete JSONs
         hardened_printer, hp_json, printer_name = harden_printer_json(pick_printer, wd)
         hardened_process, _ = harden_process_json(pick_process0, wd, infill_pct=pct, printer_name=printer_name, printer_json=hp_json)
         hardened_filament, _ = harden_filament_json(pick_filament, wd)
@@ -611,81 +591,53 @@ async def estimate_time(
         attempts = []
         result_matrix = []
 
-        def cmd_ini_join():
-            return [XVFB, "-a", which, "--debug", str(int(debug) if isinstance(debug, int) else 0),
-                    "--datadir", str(datadir),
-                    "--load-settings", f"{printer_ini};{process_ini}",
-                    "--load-filaments", str(filament_ini),
-                    "--export-slicedata", str(out_meta),
-                    str(inp), "--slice", "1", "--export-3mf", str(out_3mf)]
-
-        def cmd_ini_split():
-            return [XVFB, "-a", which, "--debug", str(int(debug) if isinstance(debug, int) else 0),
-                    "--datadir", str(datadir),
-                    "--load-settings", str(printer_ini),
-                    "--load-settings", str(process_ini),
-                    "--load-filaments", str(filament_ini),
-                    str(inp), "--slice", "1", "--export-3mf", str(out_3mf),
-                    "--export-slicedata", str(out_meta)]
-
         def cmd_json_join():
-            return [XVFB, "-a", which, "--debug", str(int(debug) if isinstance(debug, int) else 0),
-                    "--datadir", str(datadir),
-                    "--load-settings", f"{hardened_printer};{hardened_process}",
-                    "--load-filaments", str(hardened_filament),
-                    "--export-slicedata", str(out_meta),
-                    str(inp), "--slice", "1", "--export-3mf", str(out_3mf)]
+            cmd = [XVFB, "-a", which, "--debug", str(int(debug)),
+                   "--datadir", str(datadir),
+                   "--load-settings", f"{hardened_printer};{hardened_process}",
+                   "--load-filaments", str(hardened_filament),
+                   "--export-slicedata", str(out_meta),
+                   str(inp), "--slice", "1", "--export-3mf", str(out_3mf)]
+            if int(no_check or 0) == 1:
+                cmd.append("--no-check")
+            return cmd
 
         def cmd_json_split():
-            return [XVFB, "-a", which, "--debug", str(int(debug) if isinstance(debug, int) else 0),
-                    "--datadir", str(datadir),
-                    "--load-settings", str(hardened_printer),
-                    "--load-settings", str(hardened_process),
-                    "--load-filaments", str(hardened_filament),
-                    str(inp), "--slice", "1", "--export-3mf", str(out_3mf),
-                    "--export-slicedata", str(out_meta)]
+            cmd = [XVFB, "-a", which, "--debug", str(int(debug)),
+                   "--datadir", str(datadir),
+                   "--load-settings", str(hardened_printer),
+                   "--load-settings", str(hardened_process),
+                   "--load-filaments", str(hardened_filament),
+                   str(inp), "--slice", "1", "--export-3mf", str(out_3mf),
+                   "--export-slicedata", str(out_meta)]
+            if int(no_check or 0) == 1:
+                cmd.append("--no-check")
+            return cmd
 
-        # Matrix-Steuerung
-        plan = []
-        if INI_FIRST:
-            plan += [("try-1-ini-join", cmd_ini_join), ("try-2-ini-split", cmd_ini_split)]
-            plan += [("try-3-json-join", cmd_json_join), ("try-4-json-split", cmd_json_split)]
-        else:
-            plan += [("try-1-json-join", cmd_json_join), ("try-2-json-split", cmd_json_split)]
-            plan += [("try-3-ini-join", cmd_ini_join), ("try-4-ini-split", cmd_ini_split)]
+        plan = [("try-1-json-join", cmd_json_join), ("try-2-json-split", cmd_json_split)]
 
         last_code, last_out, last_err = None, "", ""
-        finished = False
-
         for tag, factory in plan:
             cmd = factory()
             code, out, err = run(cmd, timeout=900)
             attempts.append({"tag": tag, "cmd": " ".join(cmd), "stderr_tail": (err or out)[-2000:], "code": code})
             result_matrix.append({"tag": tag, "ok": code == 0})
             last_code, last_out, last_err = code, out, err
-            if code == 0 and not matrix:  # beim ersten Erfolg abbrechen, außer Matrix-Mode
-                finished = True
+            if code == 0 and not matrix:
                 break
 
         if matrix:
-            return {"ok": any(x["ok"] for x in result_matrix), "matrix": result_matrix, "attempts": attempts}
+            return {"ok": any(x["ok"] for x in result_matrix), "matrix": result_matrix, "attempts": attempts,
+                    "printer_used": Path(pick_printer).name, "process_used": Path(pick_process0).name, "filament_used": Path(pick_filament).name}
 
         if last_code != 0:
-            # Diagnose erweitern
             diag = {
                 "message": "Slicing fehlgeschlagen (alle Strategien).",
                 "attempts": attempts,
+                "printer_hardened_json": Path(hardened_printer).read_text()[:2000],
+                "process_hardened_json": Path(hardened_process).read_text()[:2000],
+                "filament_hardened_json": Path(hardened_filament).read_text()[:2000],
             }
-            # füge INIs / gehärtete Profile (gekürzt) bei
-            def safe_read(p: Path, n=1200):
-                try: return p.read_text()[:n]
-                except: return None
-            diag["printer_ini"]  = safe_read(Path(printer_ini) if isinstance(printer_ini, Path) else Path(str(printer_ini)))
-            diag["process_ini"]  = safe_read(Path(process_ini) if isinstance(process_ini, Path) else Path(str(process_ini)))
-            diag["filament_ini"] = safe_read(Path(filament_ini) if isinstance(filament_ini, Path) else Path(str(filament_ini)))
-            diag["printer_hardened_json"]  = safe_read(Path(hardened_printer))
-            diag["process_hardened_json"]  = safe_read(Path(hardened_process))
-            diag["filament_hardened_json"] = safe_read(Path(hardened_filament))
             raise HTTPException(500, detail=diag)
 
         meta = parse_slicedata_folder(out_meta)
@@ -705,7 +657,7 @@ async def estimate_time(
             "duration_s": float(meta["duration_s"]),
             "filament_mm": meta.get("filament_mm"),
             "filament_g": meta.get("filament_g"),
-            "notes": f"Sliced via {'INI-first' if INI_FIRST else 'JSON-first'}; setze force_known_good=1 für festen Notanker; matrix=1 zeigt Varianten."
+            "notes": "Sliced via JSON-first; /selftest nutzt known-good JSON."
         }
     finally:
         shutil.rmtree(wd, ignore_errors=True)
