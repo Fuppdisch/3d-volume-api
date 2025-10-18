@@ -1,608 +1,587 @@
+# app.py
+import os
 import io
 import json
-import os
 import shutil
-import subprocess
 import tempfile
-import textwrap
-import time
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import hashlib
+import subprocess
+from typing import Optional, Literal, Dict, Any, List
 
-import numpy as np
-import trimesh
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
-# -----------------------------
-# FastAPI Grund-Setup + CORS
-# -----------------------------
+# ---- Konfiguration ---------------------------------------------------------
 
-app = FastAPI(title="Online 3D-Druck Kalkulator & Slicer", version="0.5.0")
+API_TITLE = "Online 3D-Druck Kalkulator & Slicer API"
+DESCRIPTION = "FastAPI-Backend für Volumen, Gewicht & OrcaSlicer-Checks"
+VERSION = "2025-10-18"
 
-# CORS: in Produktion auf deine Domain(s) begrenzen
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: später auf https://deinedomain.tld begrenzen
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------
-# Konstanten / Profile / Dichte
-# -----------------------------
-
-API_BASE = os.environ.get("API_BASE", "")
-ORCA_BIN_FALLBACKS = [
+# Pfade und Binaries
+ORCA_CANDIDATES = [
     "/opt/orca/bin/orca-slicer",
     "/usr/local/bin/orca-slicer",
-    "/usr/bin/orca-slicer",
+    "orca-slicer",
 ]
+XVFB = os.environ.get("XVFB_BIN", "/usr/bin/xvfb-run")
 
-PROFILES_ROOT = Path("/app/profiles")
-PRINTER_DIR = PROFILES_ROOT / "printers"
-PROCESS_DIR = PROFILES_ROOT / "process"
-FILAMENT_DIR = PROFILES_ROOT / "filaments"
+# Profile im Image/Repo
+PROFILES_ROOT = os.environ.get("PROFILES_ROOT", "/app/profiles")
+PRINTERS_DIR = os.path.join(PROFILES_ROOT, "printers")
+PROCESS_DIR = os.path.join(PROFILES_ROOT, "process")
+FILAMENTS_DIR = os.path.join(PROFILES_ROOT, "filaments")
 
-DEFAULT_PRINTER = "X1C.json"                 # passe bei Bedarf an
-DEFAULT_PROCESS = "0.20mm_standard.json"     # passe bei Bedarf an
-
-DENSITIES_G_CM3 = {
+# Materialdichten (g/cm³) – deckungsgleich mit deinem Frontend
+MATERIAL_DENSITY = {
     "PLA": 1.25,
     "PETG": 1.26,
     "ASA": 1.08,
     "PC": 1.20,
 }
 
-# -----------------------------
-# Utils
-# -----------------------------
+# CORS – später auf deine Domain(s) begrenzen!
+ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",")
 
-def _which_orca() -> Tuple[bool, str]:
-    for path in ORCA_BIN_FALLBACKS:
-        if Path(path).exists():
-            return True, path
-    # last resort: whatever "orca-slicer" resolves to
-    try:
-        out = subprocess.check_output(["which", "orca-slicer"], text=True).strip()
-        if out:
-            return True, out
-    except Exception:
-        pass
-    return False, ""
+# ---- FastAPI Setup ---------------------------------------------------------
 
-def _tail(s: str, n: int = 40) -> str:
-    lines = s.splitlines()
-    return "\n".join(lines[-n:])
+app = FastAPI(title=API_TITLE, description=DESCRIPTION, version=VERSION)
 
-def _run(cmd: List[str], env: Optional[Dict[str, str]] = None, timeout: int = 180) -> Dict:
-    """
-    Führt einen Prozess aus und liefert Exitcode, stdout/stderr (Tail).
-    """
-    try:
-        p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-            env=env or os.environ.copy(),
-        )
-        return {
-            "code": p.returncode,
-            "stdout_tail": _tail(p.stdout),
-            "stderr_tail": _tail(p.stderr),
-        }
-    except subprocess.TimeoutExpired as e:
-        return {"code": 124, "stdout_tail": _tail(e.stdout or ""), "stderr_tail": _tail(e.stderr or "TIMEOUT")}
-    except Exception as e:
-        return {"code": 1, "stdout_tail": "", "stderr_tail": f"{type(e).__name__}: {e}"}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+# ---- Modelle ---------------------------------------------------------------
 
-def _save_json(path: Path, data: dict):
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+class AnalyzeOut(BaseModel):
+    model_id: str
+    volume_mm3: float
+    volume_cm3: float
 
-def _pick_profile(dirpath: Path, preferred_filename: str = "") -> Optional[Path]:
-    if preferred_filename:
-        p = dirpath / preferred_filename
-        if p.exists():
-            return p
-    # else: first json file
-    files = sorted(dirpath.glob("*.json"))
-    return files[0] if files else None
+class WeightDirectIn(BaseModel):
+    volume_mm3: float
+    material: Literal["PLA", "PETG", "ASA", "PC"]
+    infill: float  # 0..1
 
-def _match_filament(material: str) -> Optional[Path]:
-    if not material:
-        return _pick_profile(FILAMENT_DIR)
-    material = material.upper()
-    for p in sorted(FILAMENT_DIR.glob("*.json")):
-        if material in p.stem.upper():
-            return p
-    return _pick_profile(FILAMENT_DIR)
+class WeightDirectOut(BaseModel):
+    weight_g: float
 
-# -----------------------------
-# Volumen / Reparatur
-# -----------------------------
+# ---- Hilfsfunktionen: Volumen ---------------------------------------------
 
-def _repair_and_volume(file_bytes: bytes, unit: str = "mm") -> Dict[str, float]:
-    """
-    Robust: versucht normales Laden & Reparatur. Falls leaky, voxel-Fallback.
-    """
+def _safe_float3(x: float) -> float:
+    return float(f"{x:.3f}")
+
+def _hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+def _analyze_mesh_bytes(data: bytes, unit: Literal["mm","cm","m"]) -> Dict[str, Any]:
+    # Lazy Import: trimesh ist groß, erst hier laden
+    import trimesh
+    import numpy as np
+
+    # Laden
     mesh = None
     try:
-        mesh = trimesh.load(io.BytesIO(file_bytes), file_type=None, force="mesh")
+        mesh = trimesh.load(io.BytesIO(data), file_type="stl", force="mesh")
     except Exception:
-        pass
+        # Retry: Autodetect
+        mesh = trimesh.load(io.BytesIO(data), force="mesh")
 
-    if mesh is None or not isinstance(mesh, trimesh.Trimesh):
-        raise HTTPException(400, detail="Datei ist kein gültiges Mesh (STL/3MF).")
+    if not isinstance(mesh, trimesh.Trimesh):
+        # Szenario: Scene -> vereinigen
+        if hasattr(mesh, "dump"):
+            mesh = mesh.dump().sum()
 
-    # Einheitenfaktor
-    unit = (unit or "mm").lower()
-    unit_scale = {"mm": 1.0, "cm": 10.0, "m": 1000.0}.get(unit, 1.0)
+    # Einheiten-Skalierung
+    if unit == "cm":
+        mesh.apply_scale(10.0)  # 1 cm = 10 mm
+    elif unit == "m":
+        mesh.apply_scale(1000.0)  # 1 m = 1000 mm
+    # bei "mm" nix tun
 
-    # Reparatur (ohne fill_holes)
+    # Reparatur
     try:
         trimesh.repair.fix_normals(mesh)
     except Exception:
         pass
     try:
-        trimesh.repair.fill_degenerate_faces(mesh)
-    except Exception:
-        pass
-    try:
-        trimesh.repair.remove_degenerate_faces(mesh)
-    except Exception:
-        pass
-    try:
-        trimesh.repair.stitch(mesh)
+        trimesh.repair.fill_holes(mesh)  # manche Orca-Versionen tolerieren offene Kanten schlecht
     except Exception:
         pass
 
-    if not mesh.is_volume:  # leaky? -> Voxel-Fallback
+    # Volumen robust bestimmen
+    volume_mm3 = None
+    if mesh.is_watertight:
         try:
-            # Voxel-Größe grob aus bounding box ableiten
-            bbox = mesh.bounding_box.extents
-            voxel_pitch = max(bbox) / 128.0 if max(bbox) > 0 else 1.0
-            vox = mesh.voxelized(pitch=voxel_pitch)
-            vol_mm3 = float(vox.as_boxes().volume)  # Näherung
+            volume_mm3 = float(mesh.volume)
         except Exception:
-            vol_mm3 = float(mesh.volume) if mesh.is_volume else 0.0
-    else:
-        vol_mm3 = float(mesh.volume)  # volumetrisch korrekt
+            volume_mm3 = None
 
-    # Einheitenskalierung (Mesh war in mm)
-    if unit_scale != 1.0:
-        # Volumen skaliert mit Faktor^3
-        vol_mm3 = vol_mm3 * (unit_scale ** 3)
+    if volume_mm3 is None or volume_mm3 <= 0:
+        # Fallback: Voxelisierung
+        try:
+            extents = mesh.extents
+            # Zielvoxelgröße: ~0.5 mm
+            pitch = 0.5
+            # bounding box volume ⇒ Anzahl Voxel abschätzen
+            shape = np.maximum((extents / pitch).astype(int), 1)
+            vox = mesh.voxelized(pitch=pitch)
+            volume_mm3 = float(vox.points.shape[0]) * (pitch ** 3)
+        except Exception:
+            # Zweiter Fallback: Konvexe Hülle
+            try:
+                hull = mesh.convex_hull
+                volume_mm3 = float(hull.volume)
+            except Exception:
+                raise HTTPException(status_code=422, detail="Volumen konnte nicht bestimmt werden")
 
     return {
-        "volume_mm3": round(vol_mm3, 3),
-        "volume_cm3": round(vol_mm3 / 1000.0, 3),
+        "volume_mm3": volume_mm3,
+        "volume_cm3": volume_mm3 / 1000.0,
+        "triangles": int(mesh.faces.shape[0]) if hasattr(mesh, "faces") else None,
+        "watertight": bool(getattr(mesh, "is_watertight", False)),
+        "bbox_mm": mesh.bounds.tolist() if hasattr(mesh, "bounds") else None,
     }
 
-# -----------------------------
-# Orca-Profil Normalisierung
-# -----------------------------
+# ---- Hilfsfunktionen: Orca / Profile --------------------------------------
 
-def _parse_bed_shape(value):
+def _which_orca() -> Optional[str]:
+    for cand in ORCA_CANDIDATES:
+        if shutil.which(cand) or os.path.exists(cand):
+            return cand
+    return None
+
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _first_file(dirpath: str, exts: List[str]) -> Optional[str]:
+    if not os.path.isdir(dirpath):
+        return None
+    for name in sorted(os.listdir(dirpath)):
+        p = os.path.join(dirpath, name)
+        if os.path.isfile(p) and any(name.lower().endswith(e) for e in exts):
+            return p
+    return None
+
+def _parse_bed_shape(value) -> List[List[float]]:
     """
-    JSON-Profile für Orca: Liste aus Zahlenpaaren ([[x,y],...]).
-    Akzeptiert sowohl "0x0"-Strings als auch [[0,0],...]; normalisiert zu [[x,y],...].
+    Bed-Polygon als Liste von Float-Paaren. Akzeptiert:
+    - bereits [[0,0],[400,0],...]
+    - String-Liste ["0x0","400x0",...]
+    - Fallback: 400x400
     """
-    pts = []
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        return [[float(a), float(b)] for a, b in value]
+
+    pts: List[List[float]] = []
     if isinstance(value, list):
-        for p in value:
-            if isinstance(p, str) and "x" in p.lower():
+        for item in value:
+            if isinstance(item, str) and "x" in item:
+                a, b = item.split("x", 1)
                 try:
-                    x, y = p.lower().split("x", 1)
-                    pts.append([float(x), float(y)])
+                    pts.append([float(a), float(b)])
                 except Exception:
                     pass
-            elif isinstance(p, (list, tuple)) and len(p) == 2:
-                try:
-                    pts.append([float(p[0]), float(p[1])])
-                except Exception:
-                    pass
-    if len(pts) < 3:
-        pts = [[0.0, 0.0], [400.0, 0.0], [400.0, 400.0], [0.0, 400.0]]
-    return pts
+    if len(pts) >= 3:
+        return pts
+    # Fallback: Quadrat 400x400
+    return [[0.0, 0.0], [400.0, 0.0], [400.0, 400.0], [0.0, 400.0]]
 
-def _normalize_machine(pj: dict) -> dict:
-    pj = dict(pj or {})
-    pj["type"] = "machine"
-    pj.setdefault("name", "RatRig V-Core 4 400 0.4 nozzle")
-    pj["printer_technology"] = "FFF"
+def _normalize_machine(machine_in: Optional[dict]) -> dict:
+    """
+    Erzeuge ein *minimal kompatibles* Machine-JSON für Orca 2.3.1.
+    Kritisch: numerische Typen für max_print_height & extruders!
+    """
+    bed_shape = _parse_bed_shape(
+        (machine_in or {}).get("bed_shape")
+        or (machine_in or {}).get("printable_area")
+        or []
+    )
+    max_h = (machine_in or {}).get("max_print_height") \
+            or (machine_in or {}).get("printable_height") \
+            or 300.0
 
-    # JSON: bed_shape als Zahlenpaare
-    pj["bed_shape"] = _parse_bed_shape(pj.get("bed_shape"))
-
-    # Diese Felder als STRINGS (Orca-JSON-Parser erwartet das)
     try:
-        pj["max_print_height"] = str(float(pj.get("max_print_height", 300)))
+        max_h_val = float(max_h)
     except Exception:
-        pj["max_print_height"] = "300"
+        max_h_val = 300.0
+
+    # Düsenliste
+    nozzle = (machine_in or {}).get("nozzle_diameter", ["0.4"])
+    if isinstance(nozzle, (int, float, str)):
+        nozzle = [nozzle]
+    nozzle = [str(x) for x in nozzle]
+
+    m = {
+        "type": "machine",
+        "version": "1",
+        "from": "user",
+        "name": (machine_in or {}).get("name") or "Generic 0.4 nozzle",
+        "printer_technology": "FFF",
+        "gcode_flavor": "marlin",
+        "bed_shape": bed_shape,             # Liste von Zahlenpaaren
+        "max_print_height": max_h_val,      # NUMERISCH!
+        "extruders": 1,                     # NUMERISCH!
+        "nozzle_diameter": nozzle,          # Liste von Strings
+    }
+    return m
+
+def _normalize_process(proc_in: Optional[dict], infill: float) -> dict:
+    """
+    Process-JSON mit erwarteten Schlüsseln. Nutzt first_layer_height statt initial_layer_height.
+    Kompatibilität offen (["*"]).
+    """
+    layer_h = str((proc_in or {}).get("layer_height", "0.2"))
+    first_layer = str((proc_in or {}).get("first_layer_height")
+                      or (proc_in or {}).get("initial_layer_height")
+                      or "0.3")
+
+    # Infill als Prozentstring
     try:
-        pj["extruders"] = str(int(pj.get("extruders", 1)))
+        infill_pct = max(0.0, min(1.0, float(infill)))
     except Exception:
-        pj["extruders"] = "1"
+        infill_pct = 0.35
+    infill_str = f"{int(round(infill_pct * 100))}%"
 
-    # nozzle_diameter als Liste von Strings
-    nd = pj.get("nozzle_diameter", ["0.4"])
-    if isinstance(nd, (int, float)):
-        nd = [nd]
-    pj["nozzle_diameter"] = [str(x) for x in (nd if isinstance(nd, list) else [nd])]
+    # Unkritische Defaults
+    line_w = str((proc_in or {}).get("line_width", "0.45"))
+    perim = str((proc_in or {}).get("perimeters", "2"))
+    top_l = str((proc_in or {}).get("top_solid_layers", (proc_in or {}).get("solid_layers", "3")))
+    bot_l = str((proc_in or {}).get("bottom_solid_layers", (proc_in or {}).get("solid_layers", "3")))
 
-    pj.setdefault("gcode_flavor", "marlin")
-    return pj
+    p = {
+        "type": "process",
+        "version": "1",
+        "from": "user",
+        "name": (proc_in or {}).get("name", "0.20mm Standard"),
 
-def _normalize_process(pr: dict, infill: float) -> dict:
-    pr = dict(pr or {})
-    pr["type"] = "process"
-    pr.setdefault("name", "0.20mm Standard")
+        "layer_height": layer_h,
+        "first_layer_height": first_layer,
 
-    # Nur EIN Infill-Feld (Prozent-String). Entferne alte "fill_density" Kollisionsquelle.
-    pr.pop("fill_density", None)
-    pr["sparse_infill_density"] = f"{int(round(max(0, min(1, float(infill))) * 100))}%"
+        # möglichst wenig druckerspezifisches hier:
+        "compatible_printers": ["*"],
+        "compatible_printers_condition": "",
 
-    # Offen kompatibel (eliminiert „process not compatible with printer“)
-    base = set(map(str, pr.get("compatible_printers", [])))
-    base.update({"*", "RatRig V-Core 4 400 0.4 nozzle"})
-    pr["compatible_printers"] = sorted(base)
-    pr["compatible_printers_condition"] = ""
+        # Infill
+        "sparse_infill_density": infill_str,
 
-    # Drucker-spezifische Keys entfernen (reduziert Prüfungen/Kollisionen)
-    for k in ("printer_model", "printer_variant", "printer_technology", "gcode_flavor"):
-        pr.pop(k, None)
+        # ein paar harmlose Parameter
+        "line_width": line_w,
+        "perimeters": perim,
+        "top_solid_layers": top_l,
+        "bottom_solid_layers": bot_l,
 
-    return pr
+        "outer_wall_speed": str((proc_in or {}).get("outer_wall_speed", "250")),
+        "inner_wall_speed": str((proc_in or {}).get("inner_wall_speed", "350")),
+        "travel_speed": str((proc_in or {}).get("travel_speed", "500")),
 
-def _harden_filament(fj: dict) -> dict:
-    fj = dict(fj or {})
-    fj.setdefault("type", "filament")
-    # Konservativ: kompatibel mit allen
-    fj["compatible_printers"] = ["*"]
-    fj["compatible_printers_condition"] = ""
-    return fj
+        "before_layer_gcode": (proc_in or {}).get("before_layer_gcode", ""),
+        "layer_gcode": (proc_in or {}).get("layer_gcode", ""),
+        "toolchange_gcode": (proc_in or {}).get("toolchange_gcode", ""),
+        "printing_by_object_gcode": (proc_in or {}).get("printing_by_object_gcode", ""),
+    }
 
-# -----------------------------
-# Schemas
-# -----------------------------
+    # Problematische Keys explizit entfernen
+    for k in ("printer_model", "printer_variant", "printer_technology", "gcode_flavor", "fill_density", "nozzle_diameter"):
+        p.pop(k, None)
 
-class AnalyzeResp(BaseModel):
-    model_id: str
-    volume_mm3: float
-    volume_cm3: float
+    return p
 
-class WeightDirectReq(BaseModel):
-    volume_mm3: float = Field(..., ge=0)
-    material: str
-    infill: float = Field(..., ge=0.0, le=1.0)
+def _load_profile_or_none(dirpath: str) -> Optional[dict]:
+    p = _first_file(dirpath, [".json", ".ini"])  # wir bevorzugen JSON; INI nicht für diesen Pfad genutzt
+    return _read_json(p) if (p and p.endswith(".json")) else None
 
-class WeightDirectResp(BaseModel):
-    weight_g: float
+def _load_filament_for_material(material: str) -> Optional[str]:
+    """
+    Liefert Pfad zur Filament-JSON, deren Dateiname das Material enthält (PLA, PETG, ASA, PC),
+    sonst None.
+    """
+    if not os.path.isdir(FILAMENTS_DIR):
+        return None
+    names = sorted(os.listdir(FILAMENTS_DIR))
+    for n in names:
+        p = os.path.join(FILAMENTS_DIR, n)
+        if os.path.isfile(p) and n.lower().endswith(".json") and material.lower() in n.lower():
+            return p
+    return None
 
-# -----------------------------
-# Routen
-# -----------------------------
+def _run_orca(orcapath: str, work: str, input_stl: str, machine_json: str, process_json: str, filament_json: Optional[str],
+              arrange: int = 1, orient: int = 1, debug: int = 1) -> Dict[str, Any]:
+    out3mf = os.path.join(work, "out.3mf")
+    slicedata = os.path.join(work, "slicedata")
+
+    os.makedirs(slicedata, exist_ok=True)
+
+    # Build CLI
+    load_settings = f"{machine_json};{process_json}"
+    cmd = [
+        XVFB, "-a",
+        orcapath,
+        "--debug", str(int(debug)),
+        "--datadir", os.path.join(work, "cfg"),
+        "--load-settings", load_settings,
+    ]
+    if filament_json:
+        cmd += ["--load-filaments", filament_json]
+
+    # optionale Plate-Hilfen
+    if arrange is not None:
+        cmd += ["--arrange", str(int(arrange))]  # 0=aus, 1=an, sonst auto
+    if orient is not None:
+        cmd += ["--orient", str(int(orient))]    # 0=aus, 1=an, sonst auto
+
+    cmd += [
+        input_stl,
+        "--slice", "1",                    # Platte 1
+        "--export-3mf", out3mf,
+        "--export-slicedata", slicedata,
+    ]
+
+    proc = subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    ok = proc.returncode == 0
+    return {
+        "ok": ok,
+        "code": proc.returncode,
+        "cmd": " ".join(cmd),
+        "stdout_tail": proc.stdout[-500:] if proc.stdout else "",
+        "stderr_tail": proc.stderr[-500:] if proc.stderr else "",
+        "out_3mf": out3mf if ok and os.path.exists(out3mf) else None,
+        "slicedata_dir": slicedata if ok and os.path.isdir(slicedata) else None,
+    }
+
+# ---- Routen ----------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return HTMLResponse(
-        textwrap.dedent(
-            f"""
-            <!doctype html>
-            <meta charset="utf-8"/>
-            <title>Orca Tester · Online 3D-Druck</title>
-            <style>
-              body {{ font-family: ui-sans-serif, system-ui, Arial; margin: 40px; max-width: 900px }}
-              h1 {{ margin-top: 0 }}
-              button, input[type=submit] {{ padding: 8px 12px; }}
-              .row {{ display:flex; gap:12px; flex-wrap: wrap; margin-bottom:16px }}
-              .card {{ border:1px solid #ddd; border-radius:10px; padding:16px; }}
-              pre {{ background:#0b1020; color:#d6e1ff; padding:12px; border-radius:8px; overflow:auto }}
-              code {{ color:#ffe28a }}
-              .muted {{ color:#666 }}
-            </style>
-            <h1>Orca-Slicer Self-Test & Upload</h1>
+    return f"""
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{API_TITLE}</title>
+<style>
+body{{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:960px;margin:2rem auto;padding:0 1rem}}
+h1{{margin:.2rem 0}} .row{{display:flex;gap:.5rem;flex-wrap:wrap;margin:.5rem 0}}
+button,a.button{{padding:.6rem 1rem;border-radius:.6rem;border:1px solid #ccc;background:#fafafa;cursor:pointer;text-decoration:none;color:#111}}
+code,pre{{background:#f6f8fa;border-radius:6px;padding:.5rem}}
+.card{{border:1px solid #eee;border-radius:12px;padding:1rem;margin:1rem 0}}
+label{{display:block;margin:.3rem 0 .1rem}}
+input,select{{padding:.4rem;border:1px solid #ccc;border-radius:.4rem}}
+</style>
+</head>
+<body>
+<h1>{API_TITLE}</h1>
+<p>Version: {VERSION}</p>
 
-            <div class="row">
-              <button onclick="fetchJSON('/health')">Health</button>
-              <button onclick="fetchJSON('/slicer_env')">Slicer&nbsp;Env</button>
-              <a href="/docs" target="_blank"><button>Swagger (API-Doku)</button></a>
-            </div>
+<div class="row">
+  <a class="button" href="/health" target="_blank">Health</a>
+  <a class="button" href="/slicer_env" target="_blank">Slicer-Env</a>
+  <a class="button" href="/docs" target="_blank">Swagger (API)</a>
+</div>
 
-            <div class="card">
-              <h3>/slice_check</h3>
-              <form id="sliceForm">
-                <div class="row">
-                  <input type="file" name="file" required />
-                  <label>unit:
-                    <select name="unit">
-                      <option>mm</option>
-                      <option>cm</option>
-                      <option>m</option>
-                    </select>
-                  </label>
-                  <label>material:
-                    <select name="material">
-                      <option>PLA</option>
-                      <option>PETG</option>
-                      <option>ASA</option>
-                      <option>PC</option>
-                    </select>
-                  </label>
-                  <label>infill: <input type="number" step="0.01" min="0" max="1" name="infill" value="0.35"/></label>
-                  <label class="muted">arrange: <input type="number" name="arrange" value="1"/></label>
-                  <label class="muted">orient: <input type="number" name="orient" value="1"/></label>
-                  <label class="muted">debug: <input type="number" name="debug" value="1"/></label>
-                  <input type="submit" value="Slice starten"/>
-                </div>
-              </form>
-            </div>
+<div class="card">
+  <h3>Test: /slice_check</h3>
+  <form action="/slice_check" method="post" enctype="multipart/form-data" target="_blank">
+    <label>STL-Datei</label>
+    <input type="file" name="file" required />
+    <div class="row">
+      <div>
+        <label>Unit</label>
+        <select name="unit">
+          <option value="mm">mm</option>
+          <option value="cm">cm</option>
+          <option value="m">m</option>
+        </select>
+      </div>
+      <div>
+        <label>Material</label>
+        <select name="material">
+          <option>PLA</option>
+          <option>PETG</option>
+          <option>ASA</option>
+          <option>PC</option>
+        </select>
+      </div>
+      <div>
+        <label>Infill (0..1)</label>
+        <input name="infill" type="number" step="0.01" min="0" max="1" value="0.35"/>
+      </div>
+      <div>
+        <label>Arrange</label>
+        <select name="arrange"><option value="1">1</option><option>0</option></select>
+      </div>
+      <div>
+        <label>Orient</label>
+        <select name="orient"><option value="1">1</option><option>0</option></select>
+      </div>
+      <div>
+        <label>Debug</label>
+        <select name="debug"><option value="1">1</option><option>0</option></select>
+      </div>
+    </div>
+    <div style="margin-top:.5rem">
+      <button type="submit">Slicen</button>
+    </div>
+  </form>
+</div>
 
-            <div class="card">
-              <h3>/analyze</h3>
-              <form id="volForm">
-                <div class="row">
-                  <input type="file" name="file" required />
-                  <label>unit:
-                    <select name="unit">
-                      <option>mm</option>
-                      <option>cm</option>
-                      <option>m</option>
-                    </select>
-                  </label>
-                  <input type="submit" value="Volumen berechnen"/>
-                </div>
-              </form>
-            </div>
-
-            <h3>Antwort</h3>
-            <pre id="out"><code>...</code></pre>
-
-            <script>
-              async function fetchJSON(path) {{
-                const res = await fetch(path);
-                const txt = await res.text();
-                document.querySelector('#out code').textContent = txt;
-              }}
-              document.querySelector('#sliceForm').addEventListener('submit', async (e) => {{
-                e.preventDefault();
-                const fd = new FormData(e.target);
-                const res = await fetch('/slice_check', {{ method:'POST', body: fd }});
-                document.querySelector('#out code').textContent = await res.text();
-              }});
-              document.querySelector('#volForm').addEventListener('submit', async (e) => {{
-                e.preventDefault();
-                const fd = new FormData(e.target);
-                const res = await fetch('/analyze', {{ method:'POST', body: fd }});
-                document.querySelector('#out code').textContent = await res.text();
-              }});
-            </script>
-            """
-        )
-    )
+<details class="card">
+  <summary>Tipps</summary>
+  <ul>
+    <li>Falls Kompatibilitätsfehler: Diese App erzeugt <em>minimale</em> kompatible JSON-Profile zur Entschärfung.</li>
+    <li>Eigene Profile unter <code>/app/profiles/</code> ablegen (printer/process/filaments).</li>
+    <li><code>--arrange</code>/<code>--orient</code> akzeptieren 0 (aus) oder 1 (an).</li>
+  </ul>
+</details>
+</body>
+</html>
+    """
 
 @app.get("/health")
 def health():
-    ok, orca = _which_orca()
-    return {"ok": True, "orca_found": ok, "orca_bin": orca, "time": int(time.time())}
+    return {"ok": True, "service": "fastapi", "version": VERSION}
 
 @app.get("/slicer_env")
 def slicer_env():
-    ok, orca = _which_orca()
-    resp = {
-        "ok": ok,
-        "bin_exists": ok,
-        "which": orca,
-        "return_code": None,
-        "help_snippet": "",
-        "profiles": {
-            "printer": [str(p) for p in sorted(PRINTER_DIR.glob("*.json"))],
-            "process": [str(p) for p in sorted(PROCESS_DIR.glob("*.json"))],
-            "filament": [str(p) for p in sorted(FILAMENT_DIR.glob("*.json"))],
-        },
+    orca = _which_orca()
+    help_snippet = None
+    ret = None
+    if orca:
+        p = subprocess.run([orca, "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        ret = p.returncode
+        help_snippet = (p.stdout or "")[:700]
+    profiles = {
+        "printer": [os.path.join(PRINTERS_DIR, n) for n in sorted(os.listdir(PRINTERS_DIR))] if os.path.isdir(PRINTERS_DIR) else [],
+        "process": [os.path.join(PROCESS_DIR, n) for n in sorted(os.listdir(PROCESS_DIR))] if os.path.isdir(PROCESS_DIR) else [],
+        "filament": [os.path.join(FILAMENTS_DIR, n) for n in sorted(os.listdir(FILAMENTS_DIR))] if os.path.isdir(FILAMENTS_DIR) else [],
     }
-    if ok:
-        r = _run([orca, "--help"])
-        resp["return_code"] = r["code"]
-        resp["help_snippet"] = _tail(r["stdout_tail"] or r["stderr_tail"], 60)
-    return resp
+    return {
+        "ok": bool(orca),
+        "slicer_bin": orca,
+        "slicer_present": bool(orca),
+        "return_code": ret,
+        "help_snippet": help_snippet,
+        "profiles": profiles,
+    }
 
-@app.post("/analyze", response_model=AnalyzeResp)
-async def analyze(file: UploadFile = File(...), unit: str = Form("mm")):
+@app.post("/analyze", response_model=AnalyzeOut)
+async def analyze(file: UploadFile = File(...), unit: Literal["mm","cm","m"] = Form("mm")):
     data = await file.read()
-    vols = _repair_and_volume(data, unit=unit)
-    model_id = f"{hash((len(data), vols['volume_mm3'])) & 0xffffffff:x}"
-    return AnalyzeResp(model_id=model_id, **vols)
+    res = _analyze_mesh_bytes(data, unit=unit)
+    model_id = _hash_bytes(data)
+    return AnalyzeOut(
+        model_id=model_id,
+        volume_mm3=_safe_float3(res["volume_mm3"]),
+        volume_cm3=_safe_float3(res["volume_cm3"]),
+    )
 
-@app.post("/weight_direct", response_model=WeightDirectResp)
-def weight_direct(req: WeightDirectReq):
-    material = (req.material or "PLA").upper()
-    density = DENSITIES_G_CM3.get(material)
-    if not density:
-        raise HTTPException(400, detail=f"Unbekanntes Material '{req.material}'. Erlaubt: {', '.join(DENSITIES_G_CM3)}")
-    # Volumen (mm³) -> cm³
-    vol_cm3 = req.volume_mm3 / 1000.0
-    # Einfaches Infill-Modell: nur Infill frisst Material (Perimeter ignoriert)
-    weight_g = vol_cm3 * density * float(req.infill)
-    return WeightDirectResp(weight_g=round(weight_g, 3))
-
-# -----------------------------
-# Slicing mit Orca-CLI
-# -----------------------------
-
-def _build_orca_cmd(
-    orca_bin: str,
-    datadir: Path,
-    printer_json: Path,
-    process_json: Path,
-    filament_json: Path,
-    input_model: Path,
-    out_3mf: Path,
-    slicedata_dir: Path,
-    arrange: Optional[int] = None,
-    orient: Optional[int] = None,
-    debug: int = 0,
-) -> List[str]:
-    """
-    Baut die Orca-CLI auf Basis der JSON-Profile.
-    Wichtige Flags laut Orca 2.3.1: --load-settings, --load-filaments, --slice <option>
-    """
-    cmd = [
-        "xvfb-run", "-a",
-        orca_bin,
-        "--debug", str(debug),
-        "--datadir", str(datadir),
-        "--load-settings", f"{printer_json};{process_json}",
-        "--load-filaments", str(filament_json),
-    ]
-    if arrange is not None:
-        cmd += ["--arrange", str(arrange)]  # 0=aus, 1=an, andere=auto
-    if orient is not None:
-        cmd += ["--orient", str(orient)]    # 0=aus, 1=an, andere=auto
-    cmd += [
-        str(input_model),
-        "--slice", "1",                    # Plate 1
-        "--export-3mf", str(out_3mf),
-        "--export-slicedata", str(slicedata_dir),
-    ]
-    return cmd
+@app.post("/weight_direct", response_model=WeightDirectOut)
+def weight_direct(payload: WeightDirectIn):
+    vol_cm3 = payload.volume_mm3 / 1000.0
+    density = MATERIAL_DENSITY[payload.material]
+    # Infill linear ansetzen (Gehäuse/Wände ignoriert – wie besprochen)
+    weight = vol_cm3 * density * float(max(0.0, min(1.0, payload.infill)))
+    return WeightDirectOut(weight_g=_safe_float3(weight))
 
 @app.post("/slice_check")
 async def slice_check(
     file: UploadFile = File(...),
-    unit: str = Form("mm"),
-    material: str = Form("PLA"),
+    unit: Literal["mm","cm","m"] = Form("mm"),
+    material: Literal["PLA","PETG","ASA","PC"] = Form("PLA"),
     infill: float = Form(0.35),
-    arrange: Optional[int] = Form(1),
-    orient: Optional[int] = Form(1),
-    debug: int = Form(0),
+    arrange: int = Form(1),
+    orient: int = Form(1),
+    debug: int = Form(1),
 ):
-    ok, orca = _which_orca()
-    if not ok:
-        raise HTTPException(500, detail={"message": "Orca-Slicer nicht gefunden", "which": orca})
+    """
+    Sliced die übergebene STL mit:
+    - minimal gehärtetem Machine-Profil
+    - minimal kompatiblem Process-Profil (first_layer_height, offene Kompatibilität)
+    - Filament-Profil aus /app/profiles/filaments/<Material>.json (falls vorhanden)
+    """
+    orca = _which_orca()
+    if not orca:
+        raise HTTPException(status_code=500, detail="OrcaSlicer binary nicht gefunden")
 
-    # Profile bestimmen
-    printer_src = _pick_profile(PRINTER_DIR, DEFAULT_PRINTER)
-    process_src = _pick_profile(PROCESS_DIR, DEFAULT_PROCESS)
-    filament_src = _match_filament(material)
-
-    if not printer_src or not process_src or not filament_src:
-        raise HTTPException(500, detail={
-            "message": "Erforderliche Profile fehlen",
-            "printer": str(printer_src) if printer_src else None,
-            "process": str(process_src) if process_src else None,
-            "filament": str(filament_src) if filament_src else None,
-        })
-
-    # Dateien lesen
+    # Datei lesen & evtl. in mm konvertieren (wir skalieren im Analyze-Schritt; Orca bekommt mm)
+    data = await file.read()
+    # Optional: Mesh analysieren (validieren & unit->mm up-front), ansonsten direkt an Orca geben
     try:
-        pj_raw = _load_json(printer_src)
-        pr_raw = _load_json(process_src)
-        fj_raw = _load_json(filament_src)
-    except Exception as e:
-        raise HTTPException(500, detail=f"Profile konnten nicht geladen werden: {e}")
+        _ = _analyze_mesh_bytes(data, unit=unit)  # validiert grob und repariert minimal
+    except Exception:
+        pass  # selbst bei Analysefehler versuchen wir Orca-Slicing (Orca hat eigene Checks)
 
-    # Normalisieren / härten
-    pj = _normalize_machine(pj_raw)
-    pr = _normalize_process(pr_raw, infill=float(infill))
-    fj = _harden_filament(fj_raw)
+    # Profile aus Repo (wenn vorhanden)
+    base_machine_json = _load_profile_or_none(PRINTERS_DIR)
+    base_process_json = _load_profile_or_none(PROCESS_DIR)
 
-    # Temporärer Arbeitsbereich
-    tmp = Path(tempfile.mkdtemp(prefix="fixedp_"))
-    try:
-        cfg = tmp / "cfg"
-        cfg.mkdir(parents=True, exist_ok=True)
+    # Gehärtete (minimale) JSONs erzeugen
+    machine_norm = _normalize_machine(base_machine_json)
+    process_norm = _normalize_process(base_process_json, infill=infill)
 
-        printer_json = tmp / "printer_hardened.json"
-        process_json = tmp / "process_hardened.json"
-        filament_json = tmp / "filament_hardened.json"
+    # Filamentprofil: aus Repo, sonst None (dann lädt Orca Standard)
+    filament_path = _load_filament_for_material(material)
 
-        _save_json(printer_json, pj)
-        _save_json(process_json, pr)
-        _save_json(filament_json, fj)
+    with tempfile.TemporaryDirectory(prefix="fixedp_") as work:
+        input_path = os.path.join(work, "input_model.stl")
+        with open(input_path, "wb") as f:
+            f.write(data)
 
-        # Upload speichern
-        input_path = tmp / "input_model"
-        # Dateiendung beibehalten (stl/3mf)
-        suffix = Path(file.filename or "model.stl").suffix or ".stl"
-        input_path = input_path.with_suffix(suffix)
-        data = await file.read()
-        input_path.write_bytes(data)
+        mach_path = os.path.join(work, "printer_hardened.json")
+        proc_path = os.path.join(work, "process_hardened.json")
+        with open(mach_path, "w", encoding="utf-8") as f:
+            json.dump(machine_norm, f, ensure_ascii=False)
+        with open(proc_path, "w", encoding="utf-8") as f:
+            json.dump(process_norm, f, ensure_ascii=False)
 
-        # Optional: Einheiten-Konvertierung (Orca kann auch --convert-unit; wir lassen Orca arbeiten)
-        # Für reine Slicing-Kompatibilität reicht es meist ohne.
-
-        out_3mf = tmp / "out.3mf"
-        slicedata_dir = tmp / "slicedata"
-
-        cmd = _build_orca_cmd(
-            orca_bin=orca,
-            datadir=cfg,
-            printer_json=printer_json,
-            process_json=process_json,
-            filament_json=filament_json,
-            input_model=input_path,
-            out_3mf=out_3mf,
-            slicedata_dir=slicedata_dir,
+        result = _run_orca(
+            orcapath=orca,
+            work=work,
+            input_stl=input_path,
+            machine_json=mach_path,
+            process_json=proc_path,
+            filament_json=filament_path,
             arrange=arrange,
             orient=orient,
             debug=debug,
         )
 
-        result = _run(cmd, timeout=240)
-
-        if result["code"] != 0:
-            # Diagnose zurückgeben
-            return JSONResponse(
+        if not result["ok"]:
+            # Fehler transparent zurückgeben inkl. der verwendeten JSONs (gekürzt)
+            raise HTTPException(
                 status_code=500,
-                content={
-                    "detail": {
-                        "message": "Slicing fehlgeschlagen.",
-                        "cmd": " ".join(cmd),
-                        "code": result["code"],
-                        "stdout_tail": result["stdout_tail"],
-                        "stderr_tail": result["stderr_tail"],
-                        "printer_hardened_json": json.dumps(pj, ensure_ascii=False),
-                        "process_hardened_json": json.dumps(pr, ensure_ascii=False),
-                        "filament_hardened_json": json.dumps(fj, ensure_ascii=False),
-                    }
+                detail={
+                    "message": "Slicing fehlgeschlagen.",
+                    "cmd": result["cmd"],
+                    "code": result["code"],
+                    "stdout_tail": result["stdout_tail"],
+                    "stderr_tail": result["stderr_tail"],
+                    "printer_hardened_json": json.dumps(machine_norm),
+                    "process_hardened_json": json.dumps(process_norm),
+                    "filament_used": filament_path,
                 },
             )
 
-        # Erfolg: ein paar Metadaten zurück
-        meta = {
+        return {
             "ok": True,
-            "cmd": " ".join(cmd),
-            "out_3mf_exists": out_3mf.exists(),
-            "slicedata_exists": slicedata_dir.exists(),
+            "cmd": result["cmd"],
+            "out_3mf": result["out_3mf"],
+            "slicedata_dir": result["slicedata_dir"],
         }
-        # Volumen mit unserer robusten Analyse (optional, praktisch fürs Frontend)
-        try:
-            vols = _repair_and_volume(data, unit=unit)
-            meta.update(vols)
-        except Exception:
-            pass
 
-        return meta
+# ---- CLI Start (Render Dockerfile startet uvicorn mit dynamischem Port) ----
 
-    finally:
-        # Artefakte NICHT auto-löschen, wenn du debuggen möchtest:
-        # shutil.rmtree(tmp, ignore_errors=True)
-        shutil.rmtree(tmp, ignore_errors=True)
-
-# -----------------------------
-# Fallback-Plain-Index (JSON)
-# -----------------------------
-
-@app.get("/healthz", response_class=PlainTextResponse)
-def healthz():
-    return "ok"
+# Beispiel Dockerfile CMD:
+# CMD ["sh","-c","uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
